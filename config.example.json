@@ -1,0 +1,12 @@
+{
+  "favorites": [],
+  "notifications": [
+    {
+      "device_id": 0,
+      "property": "value",
+      "condition": "any",
+      "message": "{name} {property} -> {newValue}"
+    }
+  ],
+  "poll_timeout_sec": 35
+}
