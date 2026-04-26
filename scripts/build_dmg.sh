@@ -81,6 +81,27 @@ Install:
   3. Launch HC3 Menu from Applications. Open Preferences and
      fill in your HC3 host, user, password, and (optionally) PIN.
 
+  4. Allow Local Network access (REQUIRED to reach the HC3).
+     The first time HC3 Menu tries to connect, macOS should
+     prompt: "HC3 Menu would like to find devices on your
+     local network." Click Allow.
+
+     If you don't see the prompt and connections fail with
+     "No route to host" (errno 65), enable it manually in:
+
+         System Settings -> Privacy & Security -> Local Network
+         -> toggle "HC3 Menu" on.
+
+     If "HC3 Menu" is not listed, reset its privacy state and
+     relaunch so the prompt re-appears:
+
+         tccutil reset All com.jangabrielsson.hc3menu
+         open "/Applications/HC3 Menu.app"
+
+     After allowing Local Network access, QUIT HC3 Menu
+     (Cmd-Q from its menu) and launch it again. macOS only
+     applies the new permission to a fresh process.
+
 This is a personal-use, unsigned build. Use at your own risk.
 EOF
 
