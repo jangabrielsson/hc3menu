@@ -11,14 +11,11 @@ A macOS menu bar app to control your **Fibaro Home Center 3** from the top of yo
 1. Download the latest **`HC3-Menu-x.y.z-arm64.dmg`** from the
    [Releases page](https://github.com/jangabrielsson/hc3menu/releases).
 2. Open the DMG and drag **HC3 Menu** into the **Applications** folder.
-3. The app is **not signed** by an Apple Developer ID (it's a free personal-use build),
-   so macOS will refuse to open it the first time. Open **Terminal** and run:
+3. Launch **HC3 Menu** from Applications. A house icon appears in the menu bar.
 
-   ```sh
-   xattr -dr com.apple.quarantine "/Applications/HC3 Menu.app"
-   ```
-
-4. Launch **HC3 Menu** from Applications. A house icon appears in the menu bar.
+> The app is signed with an Apple Developer ID and notarized by Apple, so
+> macOS opens it without warnings. (If you have an older unsigned 0.1.x build
+> installed, drag the new one over it — Gatekeeper will accept it.)
 
 ### Allow Local Network access
 
@@ -97,7 +94,6 @@ To start fresh, quit HC3 Menu and `rm -rf ~/.hc3menu`.
 
 | Problem | Try |
 |---|---|
-| "App can't be opened because Apple cannot check it for malicious software" | Run the `xattr -dr com.apple.quarantine …` command above. |
 | "No route to host" / errno 65 | Allow Local Network access (see above), then quit and relaunch. |
 | Menu shows nothing / "HC3 connection failed" | Verify host/user/password in Preferences. From Terminal: `curl -u user:pass http://<host>/api/settings/info` |
 | Want to see logs | `tail -f ~/Library/Logs/HC3\ Menu/*.log` |
@@ -114,5 +110,5 @@ If you want to run from source, hack on it, or build your own DMG, see
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Personal-use, unsigned build. No warranty.
-Not affiliated with Fibaro.
+MIT — see [LICENSE](LICENSE). Personal-use build, signed and notarized for
+distribution. No warranty. Not affiliated with Fibaro.

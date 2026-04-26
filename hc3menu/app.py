@@ -266,13 +266,35 @@ class HC3MenuApp(rumps.App):
             return
         # New version available — modal alert with two buttons.
         try:
-            resp = rumps.alert(
-                title=f"Update available: v{info.latest}",
-                message=(f"You have v{info.current}.\n\n"
-                         + (info.notes[:400] if info.notes else "")),
-                ok="Open download page",
-                cancel="Later",
-            )
+            # Force the app to the foreground so the alert isn't hidden
+            # behind other windows. Because we're an LSUIElement / Accessory
+            # app, we have to temporarily promote to a regular activation
+            # policy for the alert to actually come to front, then revert.
+            try:
+                from AppKit import NSApplication
+                _app = NSApplication.sharedApplication()
+                _prev_policy = _app.activationPolicy()
+                # NSApplicationActivationPolicyRegular = 0
+                _app.setActivationPolicy_(0)
+                _app.activateIgnoringOtherApps_(True)
+            except Exception:
+                _app = None
+                _prev_policy = None
+            try:
+                resp = rumps.alert(
+                    title=f"Update available: v{info.latest}",
+                    message=(f"You have v{info.current}.\n\n"
+                             + (info.notes[:400] if info.notes else "")),
+                    ok="Open download page",
+                    cancel="Later",
+                )
+            finally:
+                # Revert to Accessory (no Dock icon) after the alert closes.
+                if _app is not None and _prev_policy is not None:
+                    try:
+                        _app.setActivationPolicy_(_prev_policy)
+                    except Exception:
+                        pass
             if resp == 1:
                 webbrowser.open(info.download_url or info.html_url)
         except Exception:

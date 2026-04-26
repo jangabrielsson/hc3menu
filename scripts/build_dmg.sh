@@ -8,9 +8,17 @@
 #   - Python venv with project deps + py2app installed
 #   - hdiutil (built-in)
 #
-# This is an UNSIGNED build. End users must run:
-#   xattr -dr com.apple.quarantine /Applications/HC3\ Menu.app
-# to bypass Gatekeeper after dragging from the DMG.
+# Signing & notarization:
+#   By default the script signs with the developer identity below and
+#   submits the DMG to Apple for notarization. Override via env vars:
+#
+#     SIGN_IDENTITY     full identity string, or empty/"-" for ad-hoc
+#     NOTARY_PROFILE    keychain profile name from `notarytool store-credentials`
+#                       set to empty string to skip notarization.
+#
+# Examples:
+#   ./scripts/build_dmg.sh                    # signed + notarized + stapled
+#   SIGN_IDENTITY=- NOTARY_PROFILE= ./scripts/build_dmg.sh   # ad-hoc, no notarize
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -54,8 +62,25 @@ fi
 echo ">>> Stripping extended attributes..."
 xattr -cr "$APP_PATH"
 
-echo ">>> Ad-hoc codesigning (no Developer ID)..."
-codesign --force --deep --sign - "$APP_PATH"
+SIGN_IDENTITY="${SIGN_IDENTITY:-Developer ID Application: Jan Gabrielsson (TCU23SBY78)}"
+NOTARY_PROFILE="${NOTARY_PROFILE-hc3menu-notary}"
+ENTITLEMENTS="scripts/entitlements.plist"
+
+if [[ "$SIGN_IDENTITY" == "-" || -z "$SIGN_IDENTITY" ]]; then
+    echo ">>> Ad-hoc codesigning (no Developer ID)..."
+    codesign --force --deep --sign - "$APP_PATH"
+else
+    echo ">>> Codesigning with: $SIGN_IDENTITY"
+    # Sign nested binaries first (deepest first) so the outer signature is valid.
+    # --deep is deprecated for production but acceptable for a py2app bundle here;
+    # we additionally sign the .app explicitly with hardened runtime + entitlements.
+    codesign --force --deep --options runtime --timestamp \
+        --entitlements "$ENTITLEMENTS" \
+        --sign "$SIGN_IDENTITY" \
+        "$APP_PATH"
+    echo ">>> Verifying signature..."
+    codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+fi
 
 DMG_NAME="HC3-Menu-${VERSION}-arm64.dmg"
 DMG_PATH="dist/${DMG_NAME}"
@@ -67,21 +92,16 @@ mkdir -p "$STAGING"
 cp -R "$APP_PATH" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
 
-# Add a small README for unsigned-build instructions.
+# Add a small README.
 cat > "$STAGING/README.txt" <<EOF
 HC3 Menu v${VERSION}
 
 Install:
   1. Drag "HC3 Menu.app" to the Applications folder.
-  2. macOS will refuse to open the unsigned app the first time.
-     Open Terminal and run:
-
-         xattr -dr com.apple.quarantine "/Applications/HC3 Menu.app"
-
-  3. Launch HC3 Menu from Applications. Open Preferences and
+  2. Launch HC3 Menu from Applications. Open Preferences and
      fill in your HC3 host, user, password, and (optionally) PIN.
 
-  4. Allow Local Network access (REQUIRED to reach the HC3).
+  3. Allow Local Network access (REQUIRED to reach the HC3).
      The first time HC3 Menu tries to connect, macOS should
      prompt: "HC3 Menu would like to find devices on your
      local network." Click Allow.
@@ -101,8 +121,6 @@ Install:
      After allowing Local Network access, QUIT HC3 Menu
      (Cmd-Q from its menu) and launch it again. macOS only
      applies the new permission to a fresh process.
-
-This is a personal-use, unsigned build. Use at your own risk.
 EOF
 
 hdiutil create \
@@ -112,6 +130,23 @@ hdiutil create \
     "$DMG_PATH"
 
 rm -rf "$STAGING"
+
+if [[ -n "$NOTARY_PROFILE" && "$SIGN_IDENTITY" != "-" && -n "$SIGN_IDENTITY" ]]; then
+    echo ">>> Signing the DMG itself..."
+    codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
+
+    echo ">>> Submitting to Apple for notarization (profile: $NOTARY_PROFILE)..."
+    echo "    This typically takes 1-3 minutes."
+    xcrun notarytool submit "$DMG_PATH" \
+        --keychain-profile "$NOTARY_PROFILE" \
+        --wait
+
+    echo ">>> Stapling notarization ticket to DMG..."
+    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler validate "$DMG_PATH"
+else
+    echo ">>> Skipping notarization (NOTARY_PROFILE empty or ad-hoc signing)."
+fi
 
 echo ""
 echo "==============================================="
