@@ -1,64 +1,118 @@
 # HC3 Menu
 
-A macOS menu bar app (Python + [`rumps`](https://github.com/jaredks/rumps)) to control Fibaro HC3 devices.
+A macOS menu bar app to control your **Fibaro Home Center 3** from the top of your screen — toggle lights, dim, open shutters, set thermostats, see sensor values, and get notifications when things change.
 
-## Features (v1)
+> Requires **macOS 11+ on Apple Silicon (M1/M2/M3/M4)**.
 
-- Three browse modes: **Favorites**, **By Room**, **By Type**
-- Supports binary switches, dimmers/shutters, sensors (read-only), thermostats
-- Live state via `/refreshStates` long-polling in a background thread
-- macOS notifications on configurable device-property changes
-- PyObjC Preferences window (Connection + Favorites/Notifications tabs)
-- Connects directly to HC3 via REST + Basic Auth
+---
 
-## Setup
+## Install
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+1. Download the latest **`HC3-Menu-x.y.z-arm64.dmg`** from the
+   [Releases page](https://github.com/jangabrielsson/hc3menu/releases).
+2. Open the DMG and drag **HC3 Menu** into the **Applications** folder.
+3. The app is **not signed** by an Apple Developer ID (it's a free personal-use build),
+   so macOS will refuse to open it the first time. Open **Terminal** and run:
 
-## Run (dev)
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/HC3 Menu.app"
+   ```
 
-```bash
-python -m hc3menu
-```
+4. Launch **HC3 Menu** from Applications. A house icon appears in the menu bar.
 
-On first launch you'll be prompted to open Preferences and enter HC3 host/user/password.
-Credentials are stored in `~/.hc3menu/.env`, favorites/rules in `~/.hc3menu/config.json`.
+### Allow Local Network access
 
-## Build a standalone .app (later)
+The first time HC3 Menu tries to reach your HC3, macOS should pop up:
 
-```bash
-pip install -r requirements-dev.txt
-python setup.py py2app -A      # alias build (fast, dev)
-# or
-python setup.py py2app         # full standalone bundle in dist/
-```
+> *"HC3 Menu" would like to find devices on your local network.*
 
-The bundle uses `LSUIElement: True` so it appears only in the menu bar (no Dock icon).
-macOS notifications work reliably only from the bundled `.app`.
+Click **Allow**, then **quit HC3 Menu (⌘Q) and launch it again** — macOS only applies
+the new permission to a freshly started process.
 
-## Layout
+If you missed the prompt or connections fail with **"No route to host" (errno 65)**:
 
-```
-hc3menu/
-  app.py            # rumps app, glue
-  hc3_client.py     # HC3 REST wrapper
-  state.py          # StateStore + RefreshPoller
-  menu_builder.py   # per-device-type rumps.MenuItem factories
-  prefs_window.py   # PyObjC NSWindow Preferences
-  notifications.py  # rule matching + dispatch
-  config.py         # .env + ~/.hc3menu/config.json
-```
+- Open **System Settings → Privacy & Security → Local Network** and toggle
+  **HC3 Menu** on, then quit and relaunch.
+- If HC3 Menu isn't in the list, reset its privacy state in Terminal:
 
-## Testing against plua
+  ```sh
+  tccutil reset All com.jangabrielsson.hc3menu
+  open "/Applications/HC3 Menu.app"
+  ```
 
-You can point the app at a local plua emulator instead of a real HC3:
+  Then click **Refresh** in the menu so it tries to connect again and re-triggers the prompt.
 
-```bash
-plua --fibaro --run-for 0 some_qa.lua
-```
+### Connect to your HC3
 
-Then in Preferences set host=`127.0.0.1`, port=`<plua API port>`.
+Open the menu and choose **Preferences…**, then on the **Connection** tab fill in:
+
+- **Host** — your HC3's IP address (e.g. `192.168.1.50`)
+- **User** / **Password** — an HC3 account with API access
+- **PIN** *(optional)* — required only if your HC3 enforces a PIN for certain actions
+
+Click **Save**. The menu will populate within a second or two.
+
+---
+
+## Using HC3 Menu
+
+Click the house icon in the menu bar.
+
+- **Favorites** — your starred devices, always at the top.
+- **Rooms** — devices grouped by room, then by type within each room.
+- Plus (when present on your HC3) **Alarm**, **Profiles**, **Scenes**, **Attention**, **Activity**, **Debug messages**, **Diagnostics**.
+
+Inside each device submenu:
+
+- **Switches** — click the row to toggle on/off.
+- **Dimmers** — click the row to toggle on/off; **Set value…** opens a slider/input for 0–100 %.
+- **Shutters** — *Open / Close / Stop*.
+- **Thermostats** — set heating mode and target temperature.
+- **Sensors** — read-only value (temperature, lux, humidity, motion…).
+- **☆ Add to favorites / ★ Remove from favorites** — manage favorites per device.
+
+### Notifications
+
+In **Preferences → Notifications**, tick the **Notify** column for any device
+whose state changes you want to see as macOS notifications (e.g. front door opened,
+motion in garage). Notifications appear in Notification Center.
+
+### Check for updates
+
+The menu has **Check for updates…** which fetches the latest GitHub release and
+opens the download page if a newer version is available.
+
+---
+
+## Where settings are stored
+
+- `~/.hc3menu/.env` — host, user, password, PIN (plain text; `chmod 600` recommended).
+- `~/.hc3menu/config.json` — favorites and notification rules.
+
+To start fresh, quit HC3 Menu and `rm -rf ~/.hc3menu`.
+
+---
+
+## Troubleshooting
+
+| Problem | Try |
+|---|---|
+| "App can't be opened because Apple cannot check it for malicious software" | Run the `xattr -dr com.apple.quarantine …` command above. |
+| "No route to host" / errno 65 | Allow Local Network access (see above), then quit and relaunch. |
+| Menu shows nothing / "HC3 connection failed" | Verify host/user/password in Preferences. From Terminal: `curl -u user:pass http://<host>/api/settings/info` |
+| Want to see logs | `tail -f ~/Library/Logs/HC3\ Menu/*.log` |
+
+---
+
+## For developers
+
+HC3 Menu is open source (MIT) — Python + [`rumps`](https://github.com/jaredks/rumps) + PyObjC.
+If you want to run from source, hack on it, or build your own DMG, see
+[docs/DEVELOPING.md](docs/DEVELOPING.md).
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). Personal-use, unsigned build. No warranty.
+Not affiliated with Fibaro.
