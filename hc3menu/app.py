@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 import rumps
 
 from .config import AppConfig, HC3Credentials, load_config, load_credentials, save_config
+from .__version__ import __version__
+from . import updater
 from .hc3_client import HC3Client, HC3Error
 from .menu_builder import MenuActionDispatcher, build_root_menu
 from .notifications import Notifier
@@ -126,6 +128,8 @@ class HC3MenuApp(rumps.App):
             attention=self.store.attention_devices(),
             debug_messages=self.store.recent_debug_messages(20),
             on_favorite_toggle=self._on_favorite_toggle,
+            on_check_updates=self._on_check_updates,
+            version=__version__,
         )
         self.menu = items
         self._update_status_icon()
@@ -218,6 +222,50 @@ class HC3MenuApp(rumps.App):
         except Exception:
             log.exception("failed to persist favorites")
         self.ui_queue.put(("rebuild", None))
+
+    # -- Update check ---------------------------------------------------
+    def _on_check_updates(self) -> None:
+        """Background fetch of the latest GitHub release; show alert."""
+        def work():
+            info = updater.check_for_update()
+            self.ui_queue.put(("update_result", info))
+        self._action_pool.submit(work)
+
+    def _show_update_result(self, info) -> None:
+        import webbrowser
+        if info is None:
+            try:
+                rumps.notification(
+                    title="Update check failed",
+                    subtitle="",
+                    message="Could not reach GitHub. Check your connection.",
+                )
+            except Exception:
+                pass
+            return
+        if not info.is_newer:
+            try:
+                rumps.notification(
+                    title="HC3 Menu is up to date",
+                    subtitle=f"v{info.current}",
+                    message="",
+                )
+            except Exception:
+                pass
+            return
+        # New version available — modal alert with two buttons.
+        try:
+            resp = rumps.alert(
+                title=f"Update available: v{info.latest}",
+                message=(f"You have v{info.current}.\n\n"
+                         + (info.notes[:400] if info.notes else "")),
+                ok="Open download page",
+                cancel="Later",
+            )
+            if resp == 1:
+                webbrowser.open(info.download_url or info.html_url)
+        except Exception:
+            log.exception("update alert failed")
 
     # -- Status bar icon -------------------------------------------------
     def _update_status_icon(self) -> None:
@@ -436,6 +484,10 @@ class HC3MenuApp(rumps.App):
         items = self.ui_queue.drain()
         if not items:
             return
+        # Handle update-result events independently from menu rebuilds.
+        for kind, payload in items:
+            if kind == "update_result":
+                self._show_update_result(payload)
         # Coalesce: any change → single rebuild
         change_count = sum(1 for kind, _ in items if kind == "change")
         rebuild_req = any(kind == "rebuild" for kind, _ in items)
@@ -478,6 +530,13 @@ def main() -> None:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # Quiet down noisy libraries
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    # Hide from the Dock when running from source (the packaged .app uses
+    # LSUIElement=True in its Info.plist; this covers `python -m hc3menu`).
+    try:
+        from AppKit import NSApplication
+        NSApplication.sharedApplication().setActivationPolicy_(2)  # Accessory
+    except Exception:
+        pass
     HC3MenuApp().run()
 
 

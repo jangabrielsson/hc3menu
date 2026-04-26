@@ -757,6 +757,8 @@ def build_root_menu(store: StateStore,
                     debug_messages: Optional[list[dict]] = None,
                     diagnostics: Optional[tuple[dict, list[float]]] = None,
                     on_favorite_toggle: Optional[Callable[[int], None]] = None,
+                    on_check_updates: Optional[Callable[[], None]] = None,
+                    version: Optional[str] = None,
                     ) -> list:
     """Return a list suitable for assigning to rumps.App.menu."""
     devices = store.all_devices()
@@ -819,6 +821,15 @@ def build_root_menu(store: StateStore,
 
     refresh_item = rumps.MenuItem("Refresh now", callback=lambda _: on_refresh())
     prefs_item = rumps.MenuItem("Preferences…", callback=lambda _: on_prefs())
+    update_item: Optional[rumps.MenuItem] = None
+    if on_check_updates is not None:
+        title = "Check for updates…"
+        if version:
+            title = f"Check for updates…  (v{version})"
+        update_item = rumps.MenuItem(title, callback=lambda _: on_check_updates())
+        _set_icon(update_item, "arrow.down.circle")
+    quit_item = rumps.MenuItem("Quit HC3 Menu", callback=lambda _: rumps.quit_application(),
+                               key="q")
 
     result = [fav_menu, rooms_menu]
     alarm_menu = build_alarm_menu(
@@ -859,6 +870,9 @@ def build_root_menu(store: StateStore,
         result.append(None)
         result.extend(extras)
     result += [None, refresh_item, prefs_item]
+    if update_item is not None:
+        result.append(update_item)
+    result += [None, quit_item]
     return result
 
 
