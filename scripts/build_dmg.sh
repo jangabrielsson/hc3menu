@@ -71,13 +71,56 @@ if [[ "$SIGN_IDENTITY" == "-" || -z "$SIGN_IDENTITY" ]]; then
     codesign --force --deep --sign - "$APP_PATH"
 else
     echo ">>> Codesigning with: $SIGN_IDENTITY"
-    # Sign nested binaries first (deepest first) so the outer signature is valid.
-    # --deep is deprecated for production but acceptable for a py2app bundle here;
-    # we additionally sign the .app explicitly with hardened runtime + entitlements.
-    codesign --force --deep --options runtime --timestamp \
+
+    # py2app bundles ship hundreds of pre-signed (ad-hoc) Mach-O files
+    # under Contents/Resources/lib/.../*.so. `codesign --deep` does NOT
+    # re-sign already-signed binaries, so we must walk the bundle and
+    # re-sign each Mach-O explicitly with hardened runtime + timestamp.
+    echo "    Finding nested Mach-O binaries..."
+    NESTED=()
+    while IFS= read -r -d '' f; do
+        # Filter to actual Mach-O binaries.
+        if file -b "$f" | grep -q "Mach-O"; then
+            NESTED+=("$f")
+        fi
+    done < <(find "$APP_PATH/Contents" \
+        \( -name "*.so" -o -name "*.dylib" -o -name "*.bundle" \) \
+        -type f -print0)
+    echo "    Re-signing ${#NESTED[@]} nested binaries..."
+    for f in "${NESTED[@]}"; do
+        codesign --force --options runtime --timestamp \
+            --sign "$SIGN_IDENTITY" "$f"
+    done
+
+    # Also sign any frameworks inside (deepest first — Versions/A then the
+    # framework directory itself). py2app embeds Python.framework.
+    if [[ -d "$APP_PATH/Contents/Frameworks" ]]; then
+        echo "    Re-signing frameworks..."
+        # Sign nested executables inside frameworks first.
+        find "$APP_PATH/Contents/Frameworks" -type f -perm -u+x \
+            ! -name "*.py" ! -name "*.pyc" -print0 |
+        while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q "Mach-O"; then
+                codesign --force --options runtime --timestamp \
+                    --sign "$SIGN_IDENTITY" "$f" 2>/dev/null || true
+            fi
+        done
+        # Then the framework bundles themselves (sorted deepest first).
+        find "$APP_PATH/Contents/Frameworks" -name "*.framework" -type d -print0 |
+            sort -rz |
+            while IFS= read -r -d '' fw; do
+                codesign --force --options runtime --timestamp \
+                    --sign "$SIGN_IDENTITY" "$fw" 2>/dev/null || true
+            done
+    fi
+
+    # Finally sign the outer .app with hardened runtime + entitlements.
+    echo "    Signing outer .app bundle with entitlements..."
+    codesign --force --options runtime --timestamp \
         --entitlements "$ENTITLEMENTS" \
         --sign "$SIGN_IDENTITY" \
         "$APP_PATH"
+
     echo ">>> Verifying signature..."
     codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 fi
