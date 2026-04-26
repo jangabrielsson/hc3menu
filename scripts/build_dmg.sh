@@ -114,6 +114,18 @@ else
             done
     fi
 
+    # Sign every Mach-O executable in Contents/MacOS/ (py2app drops both
+    # the launcher and a `python` interpreter binary here).
+    echo "    Signing Contents/MacOS/ executables..."
+    for f in "$APP_PATH/Contents/MacOS/"*; do
+        [[ -f "$f" ]] || continue
+        if file -b "$f" | grep -q "Mach-O"; then
+            codesign --force --options runtime --timestamp \
+                --entitlements "$ENTITLEMENTS" \
+                --sign "$SIGN_IDENTITY" "$f"
+        fi
+    done
+
     # Finally sign the outer .app with hardened runtime + entitlements.
     echo "    Signing outer .app bundle with entitlements..."
     codesign --force --options runtime --timestamp \
