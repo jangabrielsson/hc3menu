@@ -27,6 +27,7 @@ class StateStore:
         self.cpu_pcts: list[float] = []  # per-core busy % (delta-based)
         self._prev_cpu: list[dict] = []
         self.scenes: list[dict] = []
+        self.favorite_colors: list[dict] = []
         self.last_refresh: int = 0
         # Recent activity ring buffer: list of dicts
         # {ts: float, kind: str, dev_id: int|None, dev_name: str, text: str}
@@ -81,6 +82,14 @@ class StateStore:
     def all_scenes(self) -> list[dict]:
         with self._lock:
             return list(self.scenes)
+
+    def replace_favorite_colors(self, colors: list[dict]) -> None:
+        with self._lock:
+            self.favorite_colors = list(colors or [])
+
+    def all_favorite_colors(self) -> list[dict]:
+        with self._lock:
+            return list(getattr(self, "favorite_colors", []))
 
     def add_activity(self, *, kind: str, text: str,
                      dev_id: Optional[int] = None,

@@ -104,6 +104,30 @@ class HC3Client:
         """Set per-channel color components, e.g. {'red':255,'warmWhite':128}."""
         return self.call_action(device_id, "setColorComponents", [components])
 
+    def get_favorite_colors(self) -> list[dict]:
+        """List user's favorite colors from the HC3 panel.
+
+        v2 returns items shaped like
+            {"id": 1, "name": "...", "created": ..., "modified": ...,
+             "components": {"red":255, "green":100, "blue":50,
+                            "warmWhite":0, "coldWhite":0, "brightness":100}}
+        Older firmware (v1) returns flat r/g/b/w. We try v2 first and
+        fall back to v1 to stay compatible.
+        """
+        for path in ("/panels/favoriteColors/v2", "/panels/favoriteColors"):
+            try:
+                data = self._request("GET", path)
+            except HC3Error:
+                continue
+            if not data:
+                continue
+            # HC3 sometimes wraps as {"items":[...]}; normalise to list.
+            if isinstance(data, dict) and "items" in data:
+                data = data.get("items") or []
+            if isinstance(data, list):
+                return data
+        return []
+
     # -- Alarm partitions ---------------------------------------------
     def _pin_headers(self) -> Optional[dict]:
         pin = (self.creds.pin or "").strip()

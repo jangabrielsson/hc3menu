@@ -20,27 +20,33 @@ _TARGETS: list[object] = []
 
 
 class _SliderTarget(NSObject):
-    def initWithCallback_label_(self, callback, label):
+    def initWithCallback_label_unit_step_(self, callback, label, unit, step):
         self = objc.super(_SliderTarget, self).init()
         if self is None:
             return None
         self._callback = callback
         self._label = label
+        self._unit = unit or "%"
+        self._step = int(step) if step else 5
+        self._extremes: tuple = ()
         self._last_sent = None
         self._last_seen = None
         return self
+
+    def setExtremes_(self, extremes):  # noqa: N802
+        self._extremes = tuple(extremes or ())
 
     def sliderChanged_(self, sender):
         v = int(round(sender.doubleValue()))
         self._last_seen = v
         if self._label is not None:
-            self._label.setStringValue_(f"{v}%")
-        # Throttle: send only on >=5 step change, or at the extremes.
+            self._label.setStringValue_(f"{v}{self._unit}")
+        # Throttle: send only on >=step change, or at the extremes.
         if self._callback is None:
             return
         if (self._last_sent is None
-                or abs(v - self._last_sent) >= 5
-                or v in (0, 100)):
+                or abs(v - self._last_sent) >= self._step
+                or v in self._extremes):
             self._last_sent = v
             self._callback(v)
 
@@ -55,12 +61,15 @@ class _SliderTarget(NSObject):
 
 def make_slider_view(initial: int, on_change: Callable[[int], None],
                      min_v: int = 0, max_v: int = 100,
-                     width: float = 220.0) -> NSView:
+                     width: float = 220.0,
+                     unit: str = "%",
+                     step: int = 5,
+                     label_width: float = 56.0) -> NSView:
     height = 28.0
     container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
     container.setAutoresizingMask_(NSViewWidthSizable)
 
-    label = NSTextField.alloc().initWithFrame_(NSMakeRect(width - 50, 6, 44, 16))
+    label = NSTextField.alloc().initWithFrame_(NSMakeRect(width - label_width - 6, 6, label_width, 16))
     label.setBezeled_(False)
     label.setDrawsBackground_(False)
     label.setEditable_(False)
@@ -68,10 +77,10 @@ def make_slider_view(initial: int, on_change: Callable[[int], None],
     label.setAlignment_(2)  # NSTextAlignmentRight
     label.setFont_(NSFont.systemFontOfSize_(11))
     label.setTextColor_(NSColor.secondaryLabelColor())
-    label.setStringValue_(f"{int(initial)}%")
+    label.setStringValue_(f"{int(initial)}{unit}")
     container.addSubview_(label)
 
-    slider = NSSlider.alloc().initWithFrame_(NSMakeRect(8, 4, width - 64, 20))
+    slider = NSSlider.alloc().initWithFrame_(NSMakeRect(8, 4, width - label_width - 20, 20))
     slider.setMinValue_(float(min_v))
     slider.setMaxValue_(float(max_v))
     slider.setDoubleValue_(float(initial))
@@ -79,7 +88,9 @@ def make_slider_view(initial: int, on_change: Callable[[int], None],
     # call is throttled in the target.
     slider.setContinuous_(True)
 
-    target = _SliderTarget.alloc().initWithCallback_label_(on_change, label)
+    target = _SliderTarget.alloc().initWithCallback_label_unit_step_(
+        on_change, label, unit, step)
+    target.setExtremes_((min_v, max_v))
     _TARGETS.append(target)  # keep alive
     slider.setTarget_(target)
     slider.setAction_("sliderChanged:")

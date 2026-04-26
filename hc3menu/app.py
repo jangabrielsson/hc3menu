@@ -81,6 +81,11 @@ class HC3MenuApp(rumps.App):
         except HC3Error as e:
             log.warning("Could not fetch scenes: %s", e)
             self.store.replace_scenes([])
+        try:
+            self.store.replace_favorite_colors(self.client.get_favorite_colors())
+        except HC3Error as e:
+            log.warning("Could not fetch favorite colors: %s", e)
+            self.store.replace_favorite_colors([])
 
         self.poller = RefreshPoller(
             self.client, self.store,
@@ -148,11 +153,17 @@ class HC3MenuApp(rumps.App):
             except HC3Error as e:
                 log.warning("Manual refresh failed: %s", e)
                 return
+            try:
+                fav_colors = self.client.get_favorite_colors()
+            except HC3Error as e:
+                log.warning("Could not refresh favorite colors: %s", e)
+                fav_colors = self.store.all_favorite_colors()
             self.store.replace_devices(devices)
             self.store.replace_rooms(rooms)
             self.store.replace_partitions(parts)
             self.store.replace_profiles(profiles)
             self.store.replace_scenes(scenes)
+            self.store.replace_favorite_colors(fav_colors)
             self.ui_queue.put(("rebuild", None))
 
         self._action_pool.submit(work)

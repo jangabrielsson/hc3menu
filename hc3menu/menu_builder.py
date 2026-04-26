@@ -50,11 +50,16 @@ def _make_favorite_item(dev_id: int, is_fav: bool,
     return item
 
 
-def _build_slider_item(initial: int, on_change: Callable[[int], None]) -> rumps.MenuItem:
+def _build_slider_item(initial: int, on_change: Callable[[int], None],
+                       *, min_v: int = 0, max_v: int = 100,
+                       unit: str = "%", step: int = 5,
+                       label_width: float = 56.0) -> rumps.MenuItem:
     """Return a rumps.MenuItem whose underlying NSMenuItem has a slider view."""
     from .slider_view import make_slider_view
     item = rumps.MenuItem("")  # title hidden by view
-    view = make_slider_view(initial, on_change)
+    view = make_slider_view(initial, on_change,
+                            min_v=min_v, max_v=max_v,
+                            unit=unit, step=step, label_width=label_width)
     # rumps wraps the AppKit NSMenuItem at item._menuitem
     item._menuitem.setView_(view)
     return item
@@ -394,7 +399,7 @@ def build_dimmer_item(device: dict, store: StateStore,
 
     if is_color:
         parent.add(rumps.separator)
-        parent.add(_build_color_submenu(name, dev_id, props, dispatcher, client))
+        parent.add(_build_color_submenu(name, dev_id, props, dispatcher, client, store))
 
     fav = _make_favorite_item(dev_id, is_fav, on_favorite_toggle)
     if fav is not None:
@@ -445,11 +450,86 @@ def _detect_color_kind(cc: dict) -> str:
     return "unknown"
 
 
+def _extract_fav_color(item: dict) -> Optional[tuple]:
+    """Extract (r, g, b, w, brightness, name) from an HC3 favorite-color entry.
+
+    Supports both v2 (nested `components`) and v1 (flat r/g/b/w) shapes.
+    Returns None if the entry has no usable color data.
+    """
+    if not isinstance(item, dict):
+        return None
+    comps = item.get("components")
+    if isinstance(comps, dict):
+        r = int(comps.get("red", 0) or 0)
+        g = int(comps.get("green", 0) or 0)
+        b = int(comps.get("blue", 0) or 0)
+        w = int(comps.get("warmWhite", comps.get("white", 0)) or 0)
+        bright = comps.get("brightness")
+    else:
+        r = int(item.get("r", 0) or 0)
+        g = int(item.get("g", 0) or 0)
+        b = int(item.get("b", 0) or 0)
+        w = int(item.get("w", 0) or 0)
+        bright = item.get("brightness")
+    name = item.get("name") or ""
+    if r == 0 and g == 0 and b == 0 and w == 0:
+        return None
+    return r, g, b, w, bright, name
+
+
+def _build_favorite_colors_submenu(dev_id: int, fav_colors: list[dict],
+                                   dispatcher: MenuActionDispatcher,
+                                   client) -> Optional[rumps.MenuItem]:
+    """Submenu listing the user's HC3 favorite colors, if any."""
+    if not fav_colors:
+        return None
+    from .sf_symbols import sf_image
+    from AppKit import NSColor
+
+    parent = rumps.MenuItem("Favorite colors")
+    added = 0
+    for idx, item in enumerate(fav_colors, 1):
+        parsed = _extract_fav_color(item)
+        if parsed is None:
+            continue
+        r, g, b, w, bright, name = parsed
+        label = name.strip() or f"Color {item.get('id', idx)}"
+        if isinstance(bright, (int, float)) and 0 < int(bright) < 100:
+            label = f"{label}  ({int(bright)}%)"
+        mi = rumps.MenuItem(label)
+        # Tinted swatch using SF Symbols circle.fill.
+        try:
+            tint = NSColor.colorWithSRGBRed_green_blue_alpha_(
+                r / 255.0, g / 255.0, b / 255.0, 1.0)
+            img = sf_image("circle.fill", color=tint)
+            if img is not None:
+                mi._menuitem.setImage_(img)
+        except Exception:
+            pass
+        mi.set_callback(
+            lambda _i, r=r, g=g, b=b, w=w:
+            dispatcher.submit(lambda: client.set_color(dev_id, r, g, b, w))
+        )
+        parent.add(mi)
+        added += 1
+    if added == 0:
+        return None
+    return parent
+
+
 def _build_color_submenu(name: str, dev_id: int, props: dict,
-                         dispatcher: MenuActionDispatcher, client) -> rumps.MenuItem:
+                         dispatcher: MenuActionDispatcher, client,
+                         store: Optional[StateStore] = None) -> rumps.MenuItem:
     cc = props.get("colorComponents") or {}
     kind = _detect_color_kind(cc)
     root = rumps.MenuItem("Color")
+
+    # HC3 user-curated favorite colors come first when available.
+    fav_colors = store.all_favorite_colors() if store is not None else []
+    fav_menu = _build_favorite_colors_submenu(dev_id, fav_colors, dispatcher, client)
+    if fav_menu is not None:
+        root.add(fav_menu)
+        root.add(rumps.separator)
 
     if kind in ("rgb", "rgbw", "unknown"):
         for label, glyph, r, g, b, w in _COLOR_PRESETS:
@@ -481,9 +561,80 @@ def _build_color_submenu(name: str, dev_id: int, props: dict,
         custom.set_callback(custom_cb)
         root.add(custom)
 
+        picker_item = rumps.MenuItem("Custom color…")
+
+        def picker_cb(_):
+            from . import color_picker
+            cc = props.get("colorComponents") or {}
+            try:
+                init_rgb = (int(cc.get("red", 255) or 0),
+                            int(cc.get("green", 255) or 0),
+                            int(cc.get("blue", 255) or 0))
+            except Exception:
+                init_rgb = (255, 255, 255)
+
+            # Debounce: while the user drags the wheel, NSColorPanel fires
+            # colorChanged: continuously. Coalesce to ~8 Hz to avoid HC3 spam.
+            import time as _time
+            state = {"last_sent": 0.0, "pending": None}
+            min_interval = 0.12
+
+            def on_pick(r, g, b):
+                now = _time.monotonic()
+                state["pending"] = (r, g, b)
+                if now - state["last_sent"] < min_interval:
+                    return
+                rr, gg, bb = state["pending"]
+                state["last_sent"] = now
+                state["pending"] = None
+                dispatcher.submit(lambda: client.set_color(dev_id, rr, gg, bb, 0))
+
+            color_picker.show_color_picker(
+                title=f"{name} — color",
+                initial_rgb=init_rgb,
+                on_pick=on_pick,
+            )
+
+        picker_item.set_callback(picker_cb)
+        root.add(picker_item)
+
     if kind in ("cct", "rgbw"):
         if kind == "rgbw":
             root.add(rumps.separator)
+        # Kelvin slider 2200K..6500K, mapped linearly to warmWhite/coldWhite.
+        K_MIN, K_MAX = 2200, 6500
+        try:
+            cur_ww = int(cc.get("warmWhite", 255) or 0)
+            cur_cw = int(cc.get("coldWhite", 0) or 0)
+            tot = max(1, cur_ww + cur_cw)
+            t = cur_cw / tot
+            init_k = int(round(K_MIN + t * (K_MAX - K_MIN)))
+            init_k = max(K_MIN, min(K_MAX, init_k))
+        except Exception:
+            init_k = 3000
+        # Preserve brightness if HC3 reports it on this device.
+        cur_brightness = cc.get("brightness")
+
+        def _on_kelvin(k: int) -> None:
+            t = (k - K_MIN) / (K_MAX - K_MIN)
+            cw = int(round(255 * t))
+            ww = 255 - cw
+            comps = {"warmWhite": ww, "coldWhite": cw}
+            if isinstance(cur_brightness, (int, float)):
+                comps["brightness"] = int(cur_brightness)
+            dispatcher.submit(lambda: client.set_color_components(dev_id, comps))
+
+        temp_menu = rumps.MenuItem("Color temperature")
+        try:
+            slider_item = _build_slider_item(
+                init_k, _on_kelvin,
+                min_v=K_MIN, max_v=K_MAX,
+                unit=" K", step=100, label_width=64.0,
+            )
+            temp_menu.add(slider_item)
+            temp_menu.add(rumps.separator)
+        except Exception as e:
+            log.warning("CCT slider unavailable: %s", e)
         for label, glyph, ww, cw in _CCT_PRESETS:
             mi = rumps.MenuItem(f"{glyph}  {label}")
             comps = {"warmWhite": ww, "coldWhite": cw}
@@ -491,7 +642,8 @@ def _build_color_submenu(name: str, dev_id: int, props: dict,
                 lambda _i, c=comps:
                 dispatcher.submit(lambda: client.set_color_components(dev_id, c))
             )
-            root.add(mi)
+            temp_menu.add(mi)
+        root.add(temp_menu)
 
     return root
 
