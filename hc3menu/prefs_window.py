@@ -1,7 +1,8 @@
 """PyObjC Preferences window: connection settings + notification rules.
 
 Kept intentionally simple: tabbed window with form fields and a NSTableView for devices.
-Favorites are managed per-device via the menu (☆/★ entries inside each device submenu).
+Favorites are starred via each device submenu in the menu bar; their order is
+managed in the Favorites tab here (drag to reorder, − to remove).
 """
 from __future__ import annotations
 
@@ -16,11 +17,15 @@ from AppKit import (
     NSButtonTypeSwitch, NSButtonTypeMomentaryPushIn, NSBezelStyleRounded,
     NSScrollView, NSTableView, NSTableColumn, NSAlert, NSObject,
     NSMakeRect, NSMakeSize, NSWindowController,
+    NSEvent, NSEventMaskKeyDown,
+    NSPasteboard, NSPasteboardItem,
+    NSTableViewDropAbove, NSDragOperationMove,
 )
 from Foundation import NSMutableArray
 
 from .config import HC3Credentials, AppConfig, NotificationRule, save_credentials, save_config
 from .hc3_client import HC3Client
+from . import global_hotkey as gh_mod
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +86,142 @@ class _DeviceTableSource(NSObject):
         return sorted(self._notify)
 
 
+# Pasteboard UTI used to identify a favorites-row drag.
+_FAV_PB_TYPE = "com.jangabrielsson.hc3menu.favrow"
+
+
+class _FavoritesTableSource(NSObject):
+    """NSTableView data source for the favorites reorder table."""
+
+    def initWithDevices_favorites_(self, devices, favorites):  # noqa: N802
+        self = objc.super(_FavoritesTableSource, self).init()
+        if self is None:
+            return None
+        self._by_id = {int(d["id"]): d for d in devices}
+        # Filter favorites down to those still present, preserving order.
+        self._fav_ids: list[int] = [int(f) for f in favorites if int(f) in self._by_id]
+        return self
+
+    def favoriteIds(self):  # noqa: N802
+        return list(self._fav_ids)
+
+    def removeRow_(self, row: int) -> None:  # noqa: N802
+        if 0 <= int(row) < len(self._fav_ids):
+            del self._fav_ids[int(row)]
+
+    def numberOfRowsInTableView_(self, tv):  # noqa: N802
+        return len(self._fav_ids)
+
+    def tableView_objectValueForTableColumn_row_(self, tv, col, row):  # noqa: N802
+        try:
+            dev = self._by_id[self._fav_ids[row]]
+        except (IndexError, KeyError):
+            return ""
+        ident = str(col.identifier())
+        if ident == "id":
+            return str(dev.get("id"))
+        if ident == "name":
+            return str(dev.get("name", ""))
+        if ident == "type":
+            return str(dev.get("type", ""))
+        if ident == "room":
+            return str(dev.get("roomName", "") or "")
+        return ""
+
+    # ---- Drag & drop reorder ----------------------------------------
+    def tableView_pasteboardWriterForRow_(self, tv, row):  # noqa: N802
+        item = NSPasteboardItem.alloc().init()
+        item.setString_forType_(str(int(row)), _FAV_PB_TYPE)
+        return item
+
+    def tableView_validateDrop_proposedRow_proposedDropOperation_(  # noqa: N802
+        self, tv, info, row, op
+    ):
+        if int(op) != int(NSTableViewDropAbove):
+            return 0  # NSDragOperationNone
+        return int(NSDragOperationMove)
+
+    def tableView_acceptDrop_row_dropOperation_(self, tv, info, row, op):  # noqa: N802
+        pb = info.draggingPasteboard()
+        s = pb.stringForType_(_FAV_PB_TYPE)
+        if s is None:
+            return False
+        try:
+            src = int(s)
+        except ValueError:
+            return False
+        dst = int(row)
+        if not (0 <= src < len(self._fav_ids)):
+            return False
+        # NSTableView delivers the destination row index assuming the source
+        # is still in place; adjust if removing it shifts the target down.
+        moved = self._fav_ids.pop(src)
+        if dst > src:
+            dst -= 1
+        dst = max(0, min(dst, len(self._fav_ids)))
+        self._fav_ids.insert(dst, moved)
+        tv.reloadData()
+        # Re-select the moved row for visual continuity.
+        from Foundation import NSIndexSet
+        tv.selectRowIndexes_byExtendingSelection_(
+            NSIndexSet.indexSetWithIndex_(dst), False
+        )
+        return True
+
+
+class _PrefsTarget(NSObject):
+    """Module-level Objective-C target for the prefs window.
+
+    Defined once at import time so we don't re-register the class on
+    every ``show()``, which Objective-C forbids.
+    """
+
+    def initWithOuter_(self, outer):  # noqa: N802
+        self = objc.super(_PrefsTarget, self).init()
+        if self is None:
+            return None
+        self._outer = outer
+        return self
+
+    def save_(self, _sender):  # noqa: N802
+        self._outer._do_save()
+
+    def cancel_(self, _sender):  # noqa: N802
+        self._outer.close()
+
+    def test_(self, _sender):  # noqa: N802
+        self._outer._do_test()
+
+    def filter_(self, sender):  # noqa: N802
+        outer = self._outer
+        if outer._table_source is not None:
+            outer._table_source.setFilter_(sender.stringValue())
+            tbl = outer._fields.get("table")
+            if tbl is not None:
+                tbl.reloadData()
+
+    def recordHotkey_(self, _sender):  # noqa: N802
+        self._outer._start_recording_hotkey()
+
+    def resetHotkey_(self, _sender):  # noqa: N802
+        self._outer._reset_hotkey_to_default()
+
+    def removeFavorite_(self, _sender):  # noqa: N802
+        outer = self._outer
+        tbl = outer._fields.get("fav_table")
+        src = outer._fav_source
+        if tbl is None or src is None:
+            return
+        row = int(tbl.selectedRow())
+        if row < 0:
+            return
+        src.removeRow_(row)
+        tbl.reloadData()
+
+    def windowWillClose_(self, _note):  # noqa: N802
+        self._outer._on_window_will_close()
+
+
 class PreferencesController:
     """Thin Python wrapper that builds and shows the prefs window."""
 
@@ -92,8 +233,11 @@ class PreferencesController:
         self.devices = devices
         self.on_save = on_save
         self._window: Optional[NSWindow] = None
+        self._target = None  # _PrefsTarget; created lazily
         self._table_source: Optional[_DeviceTableSource] = None
+        self._fav_source: Optional[_FavoritesTableSource] = None
         self._fields: dict[str, object] = {}
+        self._prev_activation_policy: Optional[int] = None
 
     # -- Layout helpers ---------------------------------------------------
     def _build_window(self) -> NSWindow:
@@ -111,6 +255,8 @@ class PreferencesController:
 
         tabs.addTabViewItem_(self._build_connection_tab())
         tabs.addTabViewItem_(self._build_notifications_tab())
+        tabs.addTabViewItem_(self._build_favorites_tab())
+        tabs.addTabViewItem_(self._build_shortcuts_tab())
 
         save_btn = NSButton.alloc().initWithFrame_(NSMakeRect(540, 10, 90, 30))
         save_btn.setTitle_("Save")
@@ -221,28 +367,197 @@ class PreferencesController:
         self._fields["table"] = table
         return item
 
+    def _build_favorites_tab(self) -> NSTabViewItem:
+        item = NSTabViewItem.alloc().initWithIdentifier_("favs")
+        item.setLabel_("Favorites")
+        view = item.view()
+
+        # Build fresh source each time the window is constructed.
+        self._fav_source = _FavoritesTableSource.alloc().initWithDevices_favorites_(
+            self.devices, self.config.favorites
+        )
+
+        view.addSubview_(self._label(
+            "Drag rows to reorder. Order is reflected in the menu bar.",
+            20, 360, 560,
+        ))
+
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 60, 580, 290))
+        scroll.setHasVerticalScroller_(True)
+        table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, 580, 290))
+
+        for ident, title, width in [
+            ("id",   "ID",    50),
+            ("name", "Name",  260),
+            ("type", "Type",  150),
+            ("room", "Room",  110),
+        ]:
+            col = NSTableColumn.alloc().initWithIdentifier_(ident)
+            col.headerCell().setStringValue_(title)
+            col.setWidth_(width)
+            col.setEditable_(False)
+            table.addTableColumn_(col)
+
+        table.setDataSource_(self._fav_source)
+        # Enable intra-table drag reorder.
+        table.registerForDraggedTypes_([_FAV_PB_TYPE])
+        # NSDragOperationMove == 16
+        table.setDraggingSourceOperationMask_forLocal_(16, True)
+        scroll.setDocumentView_(table)
+        view.addSubview_(scroll)
+        self._fields["fav_table"] = table
+
+        # Remove button.
+        remove_btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, 20, 110, 28))
+        remove_btn.setTitle_("Remove")
+        remove_btn.setBezelStyle_(NSBezelStyleRounded)
+        remove_btn.setTarget_(self._target)
+        remove_btn.setAction_("removeFavorite:")
+        view.addSubview_(remove_btn)
+
+        return item
+
+    def _build_shortcuts_tab(self) -> NSTabViewItem:
+        item = NSTabViewItem.alloc().initWithIdentifier_("shortcuts")
+        item.setLabel_("Shortcuts")
+        view = item.view()
+
+        # Enabled toggle.
+        enabled_btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, 360, 320, 22))
+        enabled_btn.setButtonType_(NSButtonTypeSwitch)
+        enabled_btn.setTitle_("Enable global hotkey to open the menu")
+        enabled_btn.setState_(1 if self.config.global_hotkey_enabled else 0)
+        view.addSubview_(enabled_btn)
+        self._fields["hotkey_enabled"] = enabled_btn
+
+        # Current chord display.
+        view.addSubview_(self._label("Shortcut", 20, 320))
+        chord_tf = NSTextField.alloc().initWithFrame_(NSMakeRect(150, 320, 200, 24))
+        chord_tf.setStringValue_(self._format_chord_or_default())
+        chord_tf.setBezeled_(True)
+        chord_tf.setDrawsBackground_(True)
+        chord_tf.setEditable_(False)
+        chord_tf.setSelectable_(True)
+        view.addSubview_(chord_tf)
+        self._fields["hotkey_chord"] = chord_tf
+
+        # Record button toggles between "Record…" and "Press a chord — Esc to cancel".
+        record_btn = NSButton.alloc().initWithFrame_(NSMakeRect(360, 318, 130, 28))
+        record_btn.setTitle_("Record…")
+        record_btn.setBezelStyle_(NSBezelStyleRounded)
+        record_btn.setTarget_(self._target)
+        record_btn.setAction_("recordHotkey:")
+        view.addSubview_(record_btn)
+        self._fields["hotkey_record_btn"] = record_btn
+
+        # Reset button.
+        reset_btn = NSButton.alloc().initWithFrame_(NSMakeRect(500, 318, 100, 28))
+        reset_btn.setTitle_("Reset")
+        reset_btn.setBezelStyle_(NSBezelStyleRounded)
+        reset_btn.setTarget_(self._target)
+        reset_btn.setAction_("resetHotkey:")
+        view.addSubview_(reset_btn)
+
+        # Help text.
+        help_y = 250
+        for line in (
+            "Press the new chord while in record mode. Modifiers (⌘ ⌃ ⌥ ⇧)",
+            "are required; pure letter keys cannot be used.",
+            "",
+            "macOS requires Accessibility permission for global hotkeys:",
+            "System Settings → Privacy & Security → Accessibility → enable HC3 Menu.",
+            "",
+            "Note: the chord is observed only — the keystroke is still delivered to",
+            "whichever app currently has focus, so pick a combo unlikely to clash.",
+        ):
+            lbl = self._label(line, 20, help_y, 580)
+            view.addSubview_(lbl)
+            help_y -= 22
+
+        return item
+
+    def _format_chord_or_default(self) -> str:
+        chord = gh_mod.parse_chord(self.config.global_hotkey or "")
+        if chord is None:
+            return "(none)"
+        m, k = chord
+        return gh_mod.format_chord(m, k)
+
+    # -- Hotkey recorder ------------------------------------------------
+    def _start_recording_hotkey(self) -> None:
+        if getattr(self, "_hotkey_monitor", None) is not None:
+            return  # already recording
+        btn = self._fields.get("hotkey_record_btn")
+        if btn is not None:
+            btn.setTitle_("Press chord — Esc to cancel")
+
+        def handler(event):  # noqa: ANN001 — NSEvent
+            try:
+                key = int(event.keyCode())
+                mods = int(event.modifierFlags()) & gh_mod._ALL_MODS
+                # Esc cancels.
+                if key == 53 and mods == 0:
+                    self._stop_recording_hotkey(commit=False)
+                    return None  # consume
+                if mods == 0:
+                    # Ignore bare keys; require at least one modifier.
+                    return None
+                self._stop_recording_hotkey(commit=True, mods=mods, key=key)
+                return None  # consume
+            except Exception:
+                log.exception("hotkey recorder failed")
+                self._stop_recording_hotkey(commit=False)
+                return event
+
+        try:
+            self._hotkey_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown, handler
+            )
+        except Exception:
+            log.exception("hotkey recorder: addLocalMonitor failed")
+            self._hotkey_monitor = None
+            if btn is not None:
+                btn.setTitle_("Record…")
+
+    def _stop_recording_hotkey(self, commit: bool,
+                               mods: int = 0, key: int = 0) -> None:
+        mon = getattr(self, "_hotkey_monitor", None)
+        if mon is not None:
+            try:
+                NSEvent.removeMonitor_(mon)
+            except Exception:
+                log.exception("hotkey recorder: removeMonitor failed")
+            self._hotkey_monitor = None
+        btn = self._fields.get("hotkey_record_btn")
+        if btn is not None:
+            btn.setTitle_("Record…")
+        if commit:
+            chord_text = self._chord_to_config_string(mods, key)
+            self.config.global_hotkey = chord_text
+            tf = self._fields.get("hotkey_chord")
+            if tf is not None:
+                tf.setStringValue_(gh_mod.format_chord(mods, key))
+
+    @staticmethod
+    def _chord_to_config_string(mods: int, key: int) -> str:
+        """Convert (mods, keycode) → human-parseable string for AppConfig."""
+        bits: list[str] = []
+        if mods & gh_mod.MOD_CTRL:  bits.append("ctrl")
+        if mods & gh_mod.MOD_OPT:   bits.append("alt")
+        if mods & gh_mod.MOD_SHIFT: bits.append("shift")
+        if mods & gh_mod.MOD_CMD:   bits.append("cmd")
+        bits.append(gh_mod._NAME_BY_KEYCODE.get(int(key), f"Key{key}"))
+        return "+".join(bits)
+
+    def _reset_hotkey_to_default(self) -> None:
+        self.config.global_hotkey = "ctrl+alt+cmd+H"
+        tf = self._fields.get("hotkey_chord")
+        if tf is not None:
+            tf.setStringValue_(self._format_chord_or_default())
+
     # -- Actions (Objective-C target) ------------------------------------
     def _make_target(self):
-        outer = self
-
-        class _Target(NSObject):
-            def save_(self, sender):  # noqa: N802
-                outer._do_save()
-
-            def cancel_(self, sender):  # noqa: N802
-                outer.close()
-
-            def test_(self, sender):  # noqa: N802
-                outer._do_test()
-
-            def filter_(self, sender):  # noqa: N802
-                if outer._table_source is not None:
-                    outer._table_source.setFilter_(sender.stringValue())
-                    tbl = outer._fields.get("table")
-                    if tbl is not None:
-                        tbl.reloadData()
-
-        return _Target.alloc().init()
+        return _PrefsTarget.alloc().initWithOuter_(self)
 
     def _read_creds(self) -> HC3Credentials:
         try:
@@ -270,6 +585,11 @@ class PreferencesController:
         creds = self._read_creds()
         notify_ids = self._table_source.notifyIds() if self._table_source else []
 
+        # Hotkey enabled comes from the checkbox; the chord text is updated
+        # live by the recorder into self.config.global_hotkey.
+        hk_btn = self._fields.get("hotkey_enabled")
+        hk_enabled = bool(hk_btn.state()) if hk_btn is not None else self.config.global_hotkey_enabled
+
         # Preserve existing rule details where possible
         existing = {int(r.device_id): r for r in self.config.notifications}
         rules = []
@@ -278,9 +598,21 @@ class PreferencesController:
             r.device_id = int(did)
             rules.append(r)
         new_cfg = AppConfig(
-            favorites=list(self.config.favorites),  # managed via menu, not here
+            favorites=(self._fav_source.favoriteIds()
+                       if self._fav_source is not None
+                       else list(self.config.favorites)),
             notifications=rules,
             poll_timeout_sec=self.config.poll_timeout_sec,
+            attention_notifications=self.config.attention_notifications,
+            low_battery_threshold=self.config.low_battery_threshold,
+            qa_error_notifications=self.config.qa_error_notifications,
+            qa_error_throttle_sec=self.config.qa_error_throttle_sec,
+            qa_crash_notifications=self.config.qa_crash_notifications,
+            auto_update_check=self.config.auto_update_check,
+            auto_update_interval_sec=self.config.auto_update_interval_sec,
+            auto_update_last_check=self.config.auto_update_last_check,
+            global_hotkey_enabled=hk_enabled,
+            global_hotkey=self.config.global_hotkey,
         )
         save_credentials(creds)
         save_config(new_cfg)
@@ -293,15 +625,45 @@ class PreferencesController:
         self.close()
 
     def show(self) -> None:
-        self._target = self._make_target()
-        self._window = self._build_window()
+        if self._window is None:
+            self._target = self._make_target()
+            self._window = self._build_window()
+            try:
+                self._window.setDelegate_(self._target)
+            except Exception:
+                pass
+        # LSUIElement → Regular so the window can take focus.
+        try:
+            from AppKit import NSApplication
+            app = NSApplication.sharedApplication()
+            if self._prev_activation_policy is None:
+                self._prev_activation_policy = int(app.activationPolicy())
+            app.setActivationPolicy_(0)
+            app.activateIgnoringOtherApps_(True)
+        except Exception:
+            log.debug("prefs: could not raise activation policy", exc_info=True)
         self._window.makeKeyAndOrderFront_(None)
         try:
-            NSApp.activateIgnoringOtherApps_(True)
+            self._window.orderFrontRegardless()
         except Exception:
             pass
 
     def close(self) -> None:
         if self._window is not None:
             self._window.close()
-            self._window = None
+
+    def _on_window_will_close(self) -> None:
+        # Drop the window so the next show() rebuilds with fresh data, but
+        # keep the _Target instance — re-creating an Objective-C subclass
+        # is what triggered the "overriding existing Objective-C class"
+        # error before.
+        self._window = None
+        if self._prev_activation_policy is not None:
+            try:
+                from AppKit import NSApplication
+                NSApplication.sharedApplication().setActivationPolicy_(
+                    self._prev_activation_policy
+                )
+            except Exception:
+                pass
+            self._prev_activation_policy = None

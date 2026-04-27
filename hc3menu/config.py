@@ -45,6 +45,25 @@ class AppConfig:
     favorites: list[int] = field(default_factory=list)
     notifications: list[NotificationRule] = field(default_factory=list)
     poll_timeout_sec: int = 35
+    # Attention notifications (battery low, dead, breach).
+    attention_notifications: bool = True
+    # Battery level (percent) at or below which a low-battery notification fires.
+    low_battery_threshold: int = 20
+    # QA error notifications from /debugMessages.
+    qa_error_notifications: bool = True
+    # Minimum seconds between notifications from the same QA tag.
+    qa_error_throttle_sec: int = 60
+    # PluginProcessCrashedEvent notifications (QA / scene auto-restarted by HC3).
+    qa_crash_notifications: bool = True
+    # Auto-check for updates on launch (and once per `auto_update_interval_sec`).
+    auto_update_check: bool = False
+    auto_update_interval_sec: int = 86400  # 24h
+    auto_update_last_check: float = 0.0  # epoch seconds; 0 = never
+    # Global keyboard shortcut to pop the menu open. Off by default since
+    # NSEvent global monitors require macOS Accessibility permission.
+    global_hotkey_enabled: bool = False
+    # Human-readable chord, parsed by global_hotkey.parse_chord().
+    global_hotkey: str = "ctrl+alt+cmd+H"
 
 
 def _ensure_dirs() -> None:
@@ -102,6 +121,16 @@ def load_config() -> AppConfig:
         favorites=[int(x) for x in data.get("favorites", [])],
         notifications=rules,
         poll_timeout_sec=int(data.get("poll_timeout_sec", 35)),
+        attention_notifications=bool(data.get("attention_notifications", True)),
+        low_battery_threshold=int(data.get("low_battery_threshold", 20)),
+        qa_error_notifications=bool(data.get("qa_error_notifications", True)),
+        qa_error_throttle_sec=int(data.get("qa_error_throttle_sec", 60)),
+        qa_crash_notifications=bool(data.get("qa_crash_notifications", True)),
+        auto_update_check=bool(data.get("auto_update_check", False)),
+        auto_update_interval_sec=int(data.get("auto_update_interval_sec", 86400)),
+        auto_update_last_check=float(data.get("auto_update_last_check", 0.0)),
+        global_hotkey_enabled=bool(data.get("global_hotkey_enabled", False)),
+        global_hotkey=str(data.get("global_hotkey", "ctrl+alt+cmd+H")),
     )
 
 
@@ -111,5 +140,15 @@ def save_config(cfg: AppConfig) -> None:
         "favorites": cfg.favorites,
         "notifications": [asdict(r) for r in cfg.notifications],
         "poll_timeout_sec": cfg.poll_timeout_sec,
+        "attention_notifications": cfg.attention_notifications,
+        "low_battery_threshold": cfg.low_battery_threshold,
+        "qa_error_notifications": cfg.qa_error_notifications,
+        "qa_error_throttle_sec": cfg.qa_error_throttle_sec,
+        "qa_crash_notifications": cfg.qa_crash_notifications,
+        "auto_update_check": cfg.auto_update_check,
+        "auto_update_interval_sec": cfg.auto_update_interval_sec,
+        "auto_update_last_check": cfg.auto_update_last_check,
+        "global_hotkey_enabled": cfg.global_hotkey_enabled,
+        "global_hotkey": cfg.global_hotkey,
     }
     CONFIG_FILE.write_text(json.dumps(payload, indent=2))

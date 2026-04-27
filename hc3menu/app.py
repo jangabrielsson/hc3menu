@@ -27,10 +27,18 @@ class HC3MenuApp(rumps.App):
         self.client: HC3Client | None = None
         self.poller: RefreshPoller | None = None
         self.ui_queue = UIEventQueue()
-        self.notifier = Notifier(self.store, self.config.notifications)
+        self.notifier = Notifier(
+            self.store, self.config.notifications,
+            attention_enabled=self.config.attention_notifications,
+            low_battery_threshold=self.config.low_battery_threshold,
+        )
         self._action_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hc3-action")
         self._lock = threading.Lock()
         self._prefs_ctrl = None  # PreferencesController; created lazily
+        self._debug_ctrl = None  # DebugLogController; created lazily
+        self._search_ctrl = None  # SearchController; created lazily
+        # Per-QA-tag throttle: tag -> last notify monotonic timestamp.
+        self._qa_error_last_notify: dict[str, float] = {}
 
         self.dispatcher = MenuActionDispatcher(self._submit_action)
 
@@ -43,6 +51,19 @@ class HC3MenuApp(rumps.App):
         # Periodic diagnostics fetch (HC3 doesn't push these via refreshStates).
         self._diag_timer = rumps.Timer(self._tick_diag, 10.0)
         self._diag_timer.start()
+
+        # Periodic auto-update check (cheap: only fires once per
+        # `auto_update_interval_sec` and only when the user opted in).
+        self._update_timer = rumps.Timer(self._tick_auto_update, 3600.0)
+        self._update_timer.start()
+        # Also kick one shortly after launch so the first check happens
+        # without waiting an hour.
+        self._launch_update_timer = rumps.Timer(self._launch_auto_update, 30.0)
+        self._launch_update_timer.start()
+
+        # Global hotkey (lazy import — keeps Carbon/AppKit cost out of tests).
+        self._hotkey = None  # GlobalHotkey, created on demand
+        self._apply_global_hotkey_config()
 
         if self.creds.is_complete():
             self._start_session()
@@ -66,6 +87,9 @@ class HC3MenuApp(rumps.App):
 
         self.store.replace_devices(devices)
         self.store.replace_rooms(rooms)
+        # Seed attention dedupe with currently-bad devices so we don't fire
+        # a notification storm on launch / reconnect.
+        self._seed_attention_state()
         try:
             self.store.replace_partitions(self.client.get_partitions())
         except HC3Error as e:
@@ -134,6 +158,32 @@ class HC3MenuApp(rumps.App):
             debug_messages=self.store.recent_debug_messages(20),
             on_favorite_toggle=self._on_favorite_toggle,
             on_check_updates=self._on_check_updates,
+            on_about=self._on_about,
+            on_show_debug_log=self._open_debug_log,
+            notification_toggles=[
+                ("Attention (battery / dead)",
+                 self.config.attention_notifications,
+                 self._toggle_attention_notifications),
+                ("QA errors",
+                 self.config.qa_error_notifications,
+                 self._toggle_qa_error_notifications),
+                ("QA crashes",
+                 self.config.qa_crash_notifications,
+                 self._toggle_qa_crash_notifications),
+            ],
+            on_show_crash_log=(
+                self._show_crash_log
+                if self._has_crash_log() else None
+            ),
+            auto_update_toggle=(
+                self.config.auto_update_check,
+                self._toggle_auto_update_check,
+            ),
+            global_hotkey_toggle=(
+                self.config.global_hotkey_enabled,
+                self.config.global_hotkey,
+                self._toggle_global_hotkey,
+            ),
             version=__version__,
         )
         self.menu = items
@@ -220,6 +270,50 @@ class HC3MenuApp(rumps.App):
     def _on_scene_click(self, scene_id: int) -> None:
         self.dispatcher.submit(lambda: self.client.run_scene(scene_id))
 
+    # -- Search ----------------------------------------------------------
+    def _open_search(self) -> None:
+        from .search_window import SearchController
+        if getattr(self, "_search_ctrl", None) is None:
+            self._search_ctrl = SearchController(
+                self.store,
+                on_run_scene=self._on_scene_click,
+                on_toggle_device=self._on_search_toggle_device,
+                on_shutter_toggle=self._on_search_shutter_toggle,
+                creds=self.creds,
+            )
+        else:
+            # Keep creds fresh in case the user reconfigured.
+            self._search_ctrl.creds = self.creds
+        self._search_ctrl.show()
+
+    def _on_search_toggle_device(self, dev_id: int) -> None:
+        """Toggle a switch/dimmer/color device based on its current value."""
+        if self.client is None:
+            return
+        d = self.store.get_device(int(dev_id)) or {}
+        actions = d.get("actions") or {}
+        if "turnOn" not in actions and "turnOff" not in actions:
+            log.info("search: device %s has no turnOn/turnOff action; ignoring",
+                     dev_id)
+            return
+        props = d.get("properties") or {}
+        on = bool(props.get("value"))
+        action = "turnOff" if on else "turnOn"
+        self.dispatcher.submit(lambda: self.client.call_action(int(dev_id), action))
+
+    def _on_search_shutter_toggle(self, dev_id: int) -> None:
+        """For shutters: open if mostly closed, otherwise close."""
+        if self.client is None:
+            return
+        d = self.store.get_device(int(dev_id)) or {}
+        props = d.get("properties") or {}
+        try:
+            v = float(props.get("value") or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        action = "open" if v < 50 else "close"
+        self.dispatcher.submit(lambda: self.client.call_action(int(dev_id), action))
+
     # -- Favorite toggle ------------------------------------------------
     def _on_favorite_toggle(self, dev_id: int) -> None:
         favs = [int(x) for x in self.config.favorites]
@@ -234,12 +328,276 @@ class HC3MenuApp(rumps.App):
             log.exception("failed to persist favorites")
         self.ui_queue.put(("rebuild", None))
 
+    # -- Attention notifications ----------------------------------------
+    def _seed_attention_state(self) -> None:
+        """Pre-populate notifier dedupe sets with currently-bad devices so
+        we don't fire a storm on launch / reconnect."""
+        threshold = self.config.low_battery_threshold
+        for d in self.store.attention_devices():
+            try:
+                dev_id = int(d["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            props = d.get("properties") or {}
+            if bool(props.get("dead")):
+                self.notifier._dead_notified.add(dev_id)
+            batt = props.get("batteryLevel")
+            if batt is not None:
+                try:
+                    if float(batt) <= threshold:
+                        self.notifier._low_batt_notified.add(dev_id)
+                except (TypeError, ValueError):
+                    pass
+
+    def _toggle_attention_notifications(self) -> None:
+        self.config.attention_notifications = not self.config.attention_notifications
+        self.notifier.configure_attention(
+            enabled=self.config.attention_notifications,
+            low_battery_threshold=self.config.low_battery_threshold,
+        )
+        if self.config.attention_notifications:
+            # Re-seed so we don't immediately notify about pre-existing issues.
+            self.notifier.reset_attention_state()
+            self._seed_attention_state()
+        try:
+            save_config(self.config)
+        except Exception:
+            log.exception("failed to persist attention_notifications")
+        self.ui_queue.put(("rebuild", None))
+
+    def _toggle_qa_error_notifications(self) -> None:
+        self.config.qa_error_notifications = not self.config.qa_error_notifications
+        # Reset throttle so re-enabling immediately works.
+        self._qa_error_last_notify.clear()
+        try:
+            save_config(self.config)
+        except Exception:
+            log.exception("failed to persist qa_error_notifications")
+        self.ui_queue.put(("rebuild", None))
+
+    def _toggle_qa_crash_notifications(self) -> None:
+        self.config.qa_crash_notifications = not self.config.qa_crash_notifications
+        try:
+            save_config(self.config)
+        except Exception:
+            log.exception("failed to persist qa_crash_notifications")
+        self.ui_queue.put(("rebuild", None))
+
+    def _handle_plugin_crash(self, change: dict) -> None:
+        """HC3 emits PluginProcessCrashedEvent when a QA's Lua process dies
+        and is auto-restarted. The payload typically carries `deviceId` (the
+        QA id) and an optional reason. We surface a notification so the user
+        sees their QA misbehaved even if they weren't watching the menu."""
+        log.warning("plugin process crashed: %r", change)
+        dev_id = change.get("deviceId") or change.get("id")
+        reason = change.get("error") or change.get("reason") or ""
+        dev_name = "?"
+        if dev_id is not None:
+            try:
+                d = self.store.get_device(int(dev_id)) or {}
+                dev_name = d.get("name") or f"QA {dev_id}"
+            except (TypeError, ValueError):
+                dev_name = f"QA {dev_id}"
+        self.store.add_activity(
+            kind="device",
+            dev_id=int(dev_id) if dev_id is not None else None,
+            dev_name=dev_name,
+            text=f"{dev_name}: process crashed (auto-restarted)",
+        )
+        if self.config.qa_crash_notifications:
+            try:
+                rumps.notification(
+                    title=f"QA crashed — {dev_name}",
+                    subtitle="HC3 restarted the plugin",
+                    message=str(reason)[:200] if reason else "",
+                )
+            except Exception:
+                log.debug("notification failed", exc_info=True)
+        self.ui_queue.put(("rebuild", None))
+
+    # -- Crash log ------------------------------------------------------
+    def _has_crash_log(self) -> bool:
+        from . import app_crashes
+        return app_crashes.crash_log_path() is not None
+
+    def _show_crash_log(self) -> None:
+        """Reveal ~/.hc3menu/crash.log in Finder."""
+        from . import app_crashes
+        import subprocess
+        path = app_crashes.crash_log_path()
+        if path is None:
+            return
+        try:
+            subprocess.run(["open", "-R", str(path)], check=False)
+        except Exception:
+            log.exception("failed to open crash log in Finder")
+
+    # -- Debug log window ----------------------------------------------
+    def _open_debug_log(self) -> None:
+        """Open the live HC3 debug log window (lazy import of PyObjC)."""
+        from .debug_window import DebugLogController
+        if getattr(self, "_debug_ctrl", None) is None:
+            self._debug_ctrl = DebugLogController(
+                self.store, self.creds, self.client
+            )
+        else:
+            # Refresh credentials/client in case they changed.
+            self._debug_ctrl.creds = self.creds
+            self._debug_ctrl.client = self.client
+        self._debug_ctrl.show()
+
+    # -- About ----------------------------------------------------------
+    def _on_about(self) -> None:
+        """Show an About dialog with version + project info."""
+        import webbrowser
+        try:
+            from AppKit import NSApplication
+            _app = NSApplication.sharedApplication()
+            _prev_policy = _app.activationPolicy()
+            _app.setActivationPolicy_(0)
+            _app.activateIgnoringOtherApps_(True)
+        except Exception:
+            _app = None
+            _prev_policy = None
+        try:
+            hc3 = ""
+            try:
+                from .config import load_credentials
+                creds = load_credentials()
+                if creds.host:
+                    hc3 = f"\nHC3: {creds.base_url()}"
+            except Exception:
+                pass
+            resp = rumps.alert(
+                title="HC3 Menu",
+                message=(
+                    f"Version {__version__}\n"
+                    "A macOS menu bar app for Fibaro Home Center 3.\n"
+                    "© 2026 Jan Gabrielsson"
+                    f"{hc3}"
+                ),
+                ok="OK",
+                other="Project page",
+            )
+        finally:
+            if _app is not None and _prev_policy is not None:
+                try:
+                    _app.setActivationPolicy_(_prev_policy)
+                except Exception:
+                    pass
+        if resp == -1:
+            webbrowser.open("https://github.com/jangabrielsson/hc3menu")
+
     # -- Update check ---------------------------------------------------
     def _on_check_updates(self) -> None:
         """Background fetch of the latest GitHub release; show alert."""
         def work():
             info = updater.check_for_update()
             self.ui_queue.put(("update_result", info))
+        self._action_pool.submit(work)
+
+    # -- Auto-update --------------------------------------------------
+    def _toggle_auto_update_check(self) -> None:
+        self.config.auto_update_check = not self.config.auto_update_check
+        try:
+            save_config(self.config)
+        except Exception:
+            log.exception("failed to persist auto_update_check")
+        self.ui_queue.put(("rebuild", None))
+        # If user just turned it on, kick a check ~immediately.
+        if self.config.auto_update_check:
+            self._launch_update_timer = rumps.Timer(self._launch_auto_update, 5.0)
+            self._launch_update_timer.start()
+
+    # -- Global hotkey ------------------------------------------------
+    def _apply_global_hotkey_config(self) -> None:
+        """(Re)install or uninstall the global hotkey to match config."""
+        try:
+            from . import global_hotkey as gh_mod
+        except Exception:
+            log.exception("global_hotkey: import failed")
+            return
+        if self._hotkey is None:
+            self._hotkey = gh_mod.GlobalHotkey(self._on_global_hotkey)
+        if not self.config.global_hotkey_enabled:
+            self._hotkey.uninstall()
+            return
+        chord = gh_mod.parse_chord(self.config.global_hotkey or "")
+        if chord is None:
+            log.warning("global_hotkey: cannot parse %r; disabling",
+                        self.config.global_hotkey)
+            return
+        mods, key = chord
+        if not self._hotkey.install(mods, key):
+            log.warning("global_hotkey: install failed (Accessibility permission?)")
+
+    def _toggle_global_hotkey(self) -> None:
+        self.config.global_hotkey_enabled = not self.config.global_hotkey_enabled
+        try:
+            save_config(self.config)
+        except Exception:
+            log.exception("failed to persist global_hotkey_enabled")
+        self._apply_global_hotkey_config()
+        self.ui_queue.put(("rebuild", None))
+        if self.config.global_hotkey_enabled and (
+                self._hotkey is None or not self._hotkey.is_installed):
+            # Likely missing Accessibility permission — surface a hint.
+            try:
+                rumps.notification(
+                    "Global hotkey not active",
+                    "Grant Accessibility permission",
+                    "System Settings → Privacy & Security → Accessibility, "
+                    "then enable HC3 Menu.",
+                )
+            except Exception:
+                pass
+
+    def _on_global_hotkey(self) -> None:
+        """Fired on the AppKit main thread when the user hits the chord.
+
+        Programmatically clicks the menubar icon so the menu drops down.
+        """
+        try:
+            item = getattr(self, "nsstatusitem", None)
+            if item is None:
+                return
+            btn = item.button() if hasattr(item, "button") else None
+            if btn is not None:
+                btn.performClick_(None)
+        except Exception:
+            log.exception("global_hotkey: failed to open menu")
+
+    def _launch_auto_update(self, sender) -> None:
+        """One-shot: fires ~30s after launch (or 5s after enabling), then
+        cancels itself. Real periodic checks come from _tick_auto_update."""
+        try:
+            sender.stop()
+        except Exception:
+            pass
+        self._tick_auto_update(sender)
+
+    def _tick_auto_update(self, _sender) -> None:
+        if not self.config.auto_update_check:
+            return
+        import time as _t
+        now = _t.time()
+        interval = max(3600, int(self.config.auto_update_interval_sec or 86400))
+        if now - float(self.config.auto_update_last_check or 0.0) < interval:
+            return
+
+        def work():
+            info = updater.check_for_update()
+            try:
+                self.config.auto_update_last_check = _t.time()
+                save_config(self.config)
+            except Exception:
+                log.debug("could not persist auto_update_last_check",
+                          exc_info=True)
+            # Only surface UI when there's actually something newer; on
+            # background polls we silently swallow "up to date" / errors so
+            # we don't spam the user.
+            if info is not None and info.is_newer:
+                self.ui_queue.put(("update_result", info))
         self._action_pool.submit(work)
 
     def _show_update_result(self, info) -> None:
@@ -351,8 +709,10 @@ class HC3MenuApp(rumps.App):
             if diag is not None:
                 self.store.update_diagnostics(diag)
             try:
-                resp = self.client.get_debug_messages(
-                    types=["warning", "error"], offset=20)
+                # Fetch all severities so the Debug log window can filter
+                # locally (trace/debug/info as well as warning/error). The
+                # notification path below only triggers on `type == error`.
+                resp = self.client.get_debug_messages(offset=100)
                 msgs = resp.get("messages") or []
                 # Detect new errors (only after first poll has happened).
                 already_initialized = bool(self.store.recent_debug_messages(1))
@@ -360,8 +720,9 @@ class HC3MenuApp(rumps.App):
                 if added and already_initialized:
                     new_errors = [m for m in self.store.recent_debug_messages(added)
                                   if m.get("type") == "error"]
-                    for m in new_errors[:3]:  # cap to 3 notifications/cycle
-                        self._notify_qa_error(m)
+                    if self.config.qa_error_notifications:
+                        for m in new_errors[:3]:  # cap to 3 notifications/cycle
+                            self._notify_qa_error(m)
             except HC3Error as e:
                 log.debug("debug messages fetch failed: %s", e)
             self.ui_queue.put(("rebuild", None))
@@ -370,6 +731,14 @@ class HC3MenuApp(rumps.App):
     def _notify_qa_error(self, msg: dict) -> None:
         try:
             tag = msg.get("tag") or "QA"
+            # Per-tag throttle: if we already notified about this QA recently,
+            # skip so a chatty QA doesn't spam Notification Center.
+            import time
+            now = time.monotonic()
+            last = self._qa_error_last_notify.get(tag, 0.0)
+            if now - last < max(1, self.config.qa_error_throttle_sec):
+                return
+            self._qa_error_last_notify[tag] = now
             text = (msg.get("message") or "").strip().replace("\n", " ")
             if len(text) > 200:
                 text = text[:197] + "…"
@@ -475,6 +844,11 @@ class HC3MenuApp(rumps.App):
                 self.ui_queue.put(("rebuild", None))
             return
 
+        # QuickApp / scene plugin process crashed (HC3 will auto-restart it).
+        if etype == "PluginProcessCrashedEvent":
+            self._handle_plugin_crash(change)
+            return
+
         dev_id = change.get("id")
         prop = change.get("property") or change.get("name")
         new_v = change.get("newValue")
@@ -483,6 +857,13 @@ class HC3MenuApp(rumps.App):
         dev_name = (dev or {}).get("name", "?")
 
         if etype == "DevicePropertyUpdatedEvent" and prop:
+            # Attention notifications (battery / dead) — must run before the
+            # _RELEVANT_PROPS filter, since `dead` and `batteryLevel` are
+            # not displayed in the menu but we still want to notify.
+            try:
+                self.notifier.handle_attention(change)
+            except Exception:
+                log.exception("attention notifier failed")
             if prop not in self._RELEVANT_PROPS:
                 log.debug("event %s: id=%s name=%r prop=%s (not displayed, skipping rebuild)",
                           etype, dev_id, dev_name, prop)
@@ -510,7 +891,10 @@ class HC3MenuApp(rumps.App):
             except HC3Error as e:
                 log.warning("Action failed: %s", e)
             except Exception:
-                log.exception("Action raised")
+                # Log + crash report (won't re-raise).
+                from . import app_crashes
+                import sys
+                app_crashes.report("action-pool", *sys.exc_info())
         self._action_pool.submit(wrapped)
 
     def _tick_ui(self, _) -> None:
@@ -550,11 +934,23 @@ class HC3MenuApp(rumps.App):
             self.creds = creds
             self.config = cfg
             self.notifier.set_rules(cfg.notifications)
+            # Re-apply global hotkey settings (chord may have changed).
+            self._apply_global_hotkey_config()
+            # Rebuild menu so the hotkey label and toggle states reflect changes.
+            self.ui_queue.put(("rebuild", None))
             self._start_session()
 
-        self._prefs_ctrl = PreferencesController(
-            self.creds, self.config, devices, on_save
-        )
+        if self._prefs_ctrl is None:
+            self._prefs_ctrl = PreferencesController(
+                self.creds, self.config, devices, on_save
+            )
+        else:
+            # Refresh data on the existing controller so re-opening picks up
+            # any changes made via the menu since last open.
+            self._prefs_ctrl.creds = self.creds
+            self._prefs_ctrl.config = self.config
+            self._prefs_ctrl.devices = devices
+            self._prefs_ctrl.on_save = on_save
         self._prefs_ctrl.show()
 
 
@@ -563,6 +959,10 @@ def main() -> None:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # Quiet down noisy libraries
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    # Install crash reporter (catches uncaught exceptions in main + worker
+    # threads, writes ~/.hc3menu/crash.log, posts a one-time notification).
+    from . import app_crashes
+    app_crashes.install()
     # Hide from the Dock when running from source (the packaged .app uses
     # LSUIElement=True in its Info.plist; this covers `python -m hc3menu`).
     try:

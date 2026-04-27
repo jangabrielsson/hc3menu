@@ -910,17 +910,25 @@ def build_root_menu(store: StateStore,
                     diagnostics: Optional[tuple[dict, list[float]]] = None,
                     on_favorite_toggle: Optional[Callable[[int], None]] = None,
                     on_check_updates: Optional[Callable[[], None]] = None,
+                    on_about: Optional[Callable[[], None]] = None,
+                    notification_toggles: Optional[list[tuple[str, bool, Callable[[], None]]]] = None,
+                    on_show_crash_log: Optional[Callable[[], None]] = None,
+                    on_show_debug_log: Optional[Callable[[], None]] = None,
+                    on_search: Optional[Callable[[], None]] = None,
+                    auto_update_toggle: Optional[tuple[bool, Callable[[], None]]] = None,
+                    global_hotkey_toggle: Optional[tuple[bool, str, Callable[[], None]]] = None,
                     version: Optional[str] = None,
                     ) -> list:
     """Return a list suitable for assigning to rumps.App.menu."""
     devices = store.all_devices()
 
-    # Favorites
+    # Favorites — preserve user-defined order from `favorites` list.
     fav_set = set(int(x) for x in favorites)
-    fav_devs = [d for d in devices if int(d["id"]) in fav_set]
+    by_id = {int(d["id"]): d for d in devices}
+    fav_devs_ordered = [by_id[int(fid)] for fid in favorites if int(fid) in by_id]
     fav_menu = rumps.MenuItem("Favorites")
-    if fav_devs:
-        for d in sorted(fav_devs, key=lambda x: x.get("name", "")):
+    if fav_devs_ordered:
+        for d in fav_devs_ordered:
             it = build_device_item(d, store, dispatcher, client,
                                    is_fav=True,
                                    on_favorite_toggle=on_favorite_toggle)
@@ -973,13 +981,66 @@ def build_root_menu(store: StateStore,
 
     refresh_item = rumps.MenuItem("Refresh now", callback=lambda _: on_refresh())
     prefs_item = rumps.MenuItem("Preferences…", callback=lambda _: on_prefs())
+    search_item: Optional[rumps.MenuItem] = None
+    if on_search is not None:
+        search_item = rumps.MenuItem(
+            "Search…", callback=lambda _: on_search(), key="f")
+        _set_icon(search_item, "magnifyingglass")
     update_item: Optional[rumps.MenuItem] = None
     if on_check_updates is not None:
         title = "Check for updates…"
         if version:
             title = f"Check for updates…  (v{version})"
-        update_item = rumps.MenuItem(title, callback=lambda _: on_check_updates())
-        _set_icon(update_item, "arrow.down.circle")
+        if auto_update_toggle is not None:
+            # Submenu: manual check + auto-check toggle.
+            update_item = rumps.MenuItem(title)
+            _set_icon(update_item, "arrow.down.circle")
+            check_now = rumps.MenuItem(
+                "Check now", callback=lambda _: on_check_updates())
+            update_item.add(check_now)
+            auto_enabled, auto_cb = auto_update_toggle
+            auto_item = rumps.MenuItem(
+                "Auto-check daily",
+                callback=lambda _i, cb=auto_cb: cb(),
+            )
+            auto_item.state = 1 if auto_enabled else 0
+            update_item.add(auto_item)
+        else:
+            update_item = rumps.MenuItem(title, callback=lambda _: on_check_updates())
+            _set_icon(update_item, "arrow.down.circle")
+    about_item: Optional[rumps.MenuItem] = None
+    if on_about is not None:
+        about_item = rumps.MenuItem("About HC3 Menu", callback=lambda _: on_about())
+        _set_icon(about_item, "info.circle")
+    crash_log_item: Optional[rumps.MenuItem] = None
+    if on_show_crash_log is not None:
+        crash_log_item = rumps.MenuItem(
+            "Show crash log…",
+            callback=lambda _: on_show_crash_log(),
+        )
+        _set_icon(crash_log_item, "exclamationmark.triangle")
+    debug_log_item: Optional[rumps.MenuItem] = None
+    if on_show_debug_log is not None:
+        debug_log_item = rumps.MenuItem(
+            "Debug log…",
+            callback=lambda _: on_show_debug_log(),
+        )
+        _set_icon(debug_log_item, "doc.text.magnifyingglass")
+    notifications_menu: Optional[rumps.MenuItem] = None
+    if notification_toggles:
+        notifications_menu = rumps.MenuItem("Notifications")
+        _set_icon(notifications_menu, "bell")
+        for label, enabled, toggle in notification_toggles:
+            it = rumps.MenuItem(label, callback=lambda _, t=toggle: t())
+            it.state = 1 if enabled else 0
+            notifications_menu.add(it)
+    hotkey_item: Optional[rumps.MenuItem] = None
+    if global_hotkey_toggle is not None:
+        hk_enabled, hk_chord, hk_cb = global_hotkey_toggle
+        label = f"Global hotkey  ({hk_chord})" if hk_chord else "Global hotkey"
+        hotkey_item = rumps.MenuItem(label, callback=lambda _, c=hk_cb: c())
+        hotkey_item.state = 1 if hk_enabled else 0
+        _set_icon(hotkey_item, "keyboard")
     quit_item = rumps.MenuItem("Quit HC3 Menu", callback=lambda _: rumps.quit_application(),
                                key="q")
 
@@ -1022,8 +1083,20 @@ def build_root_menu(store: StateStore,
         result.append(None)
         result.extend(extras)
     result += [None, refresh_item, prefs_item]
+    if search_item is not None:
+        result.append(search_item)
+    if notifications_menu is not None:
+        result.append(notifications_menu)
+    if hotkey_item is not None:
+        result.append(hotkey_item)
+    if debug_log_item is not None:
+        result.append(debug_log_item)
     if update_item is not None:
         result.append(update_item)
+    if about_item is not None:
+        result.append(about_item)
+    if crash_log_item is not None:
+        result.append(crash_log_item)
     result += [None, quit_item]
     return result
 

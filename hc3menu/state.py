@@ -33,7 +33,7 @@ class StateStore:
         # {ts: float, kind: str, dev_id: int|None, dev_name: str, text: str}
         self._activity: deque = deque(maxlen=50)
         # QA debug messages (errors/warnings) ring buffer
-        self._debug_msgs: deque = deque(maxlen=50)
+        self._debug_msgs: deque = deque(maxlen=2000)
         self._debug_seen_ids: set = set()
         # Connection state
         self._connected: bool = False

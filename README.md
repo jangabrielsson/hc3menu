@@ -2,6 +2,16 @@
 
 A macOS menu bar app to control your **Fibaro Home Center 3** from the top of your screen — toggle lights, dim, open shutters, set thermostats, see sensor values, and get notifications when things change.
 
+**Highlights**
+
+- Devices grouped by Room → Type, plus a re-orderable Favorites list.
+- Switches, dimmers, shutters, thermostats, sensors, scenes, alarm/profiles.
+- Three notification streams: device state changes, attention (battery/dead/breach), QA errors & crashes.
+- Live Debug-messages window with filter, severity picker, follow-tail, copy, and *Copy QA id* for the selected row.
+- Configurable global hotkey to drop the menu from anywhere.
+- Optional daily auto-check for new releases.
+- Signed & notarized DMG; in-app crash reporter.
+
 > Requires **macOS 11+ on Apple Silicon (M1/M2/M3/M4)**.
 
 ---
@@ -70,14 +80,38 @@ Inside each device submenu:
 
 ### Notifications
 
-In **Preferences → Notifications**, tick the **Notify** column for any device
-whose state changes you want to see as macOS notifications (e.g. front door opened,
-motion in garage). Notifications appear in Notification Center.
+Three independent notification streams, all toggleable from the **Notifications** submenu in the menu bar:
+
+- **Device state changes** — In **Preferences → Notifications**, tick the **Notify** column for any device whose state changes you want delivered to Notification Center (e.g. front door opened, motion in garage).
+- **Attention** — Battery-low, dead devices, sensor breach, alarm partition state changes. De-duplicated so you don't get spammed each poll cycle.
+- **QA errors & crashes** — QuickApp `error`/`fatal` debug messages (per-QA throttled) and HC3 `PluginProcessCrashedEvent` events.
+
+### Favorites
+
+Star a device with **☆ Add to favorites** in any device submenu. Manage the list in **Preferences → Favorites**:
+
+- **Drag rows to reorder** — the order is reflected in the menu bar's Favorites submenu.
+- Select a row + **Remove** to unstar it.
+
+### Global hotkey
+
+Open the menu from anywhere with a configurable chord (default **⌃⌥⌘H**). Toggle it on from the menu (or **Preferences → Shortcuts**) and click **Record…** to set your own combo.
+
+> macOS will ask for **Accessibility** permission the first time — grant it under *System Settings → Privacy & Security → Accessibility*.
+
+### Debug log window
+
+**Activity → Debug messages → Open window** opens a live log of all QuickApp `debug`/`trace`/`warning`/`error` messages with filter, severity picker, follow-tail, copy, and **Copy QA id** to grab the QuickApp's id from the selected row (the HC3 web UI has no stable per-QA URL, so we copy the id instead of opening a browser).
+
+If a QuickApp itself crashes on the HC3, a one-time notification fires and the crash is recorded in the **Activity** list.
+
+### Crash reporter
+
+If HC3 Menu itself hits an unhandled exception, the traceback is written to `~/.hc3menu/crash.log` and a one-time notification appears. Use **Show crash log** from the menu to inspect it.
 
 ### Check for updates
 
-The menu has **Check for updates…** which fetches the latest GitHub release and
-opens the download page if a newer version is available.
+**Check for updates…** fetches the latest GitHub release and opens the download page if a newer version is available. Enable **Auto-check daily** in the same submenu to have HC3 Menu poll once per day in the background; it only surfaces UI when something newer actually exists.
 
 ---
 
@@ -104,11 +138,11 @@ To start fresh, quit HC3 Menu and `rm -rf ~/.hc3menu`.
 
 HC3 Menu is open source (MIT) — Python + [`rumps`](https://github.com/jaredks/rumps) + PyObjC.
 If you want to run from source, hack on it, or build your own DMG, see
-[docs/DEVELOPING.md](docs/DEVELOPING.md).
+[docs/DEVELOPING.md](https://github.com/jangabrielsson/hc3menu/blob/main/docs/DEVELOPING.md).
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Personal-use build, signed and notarized for
+MIT — see [LICENSE](https://github.com/jangabrielsson/hc3menu/blob/main/LICENSE). Personal-use build, signed and notarized for
 distribution. No warranty. Not affiliated with Fibaro.
