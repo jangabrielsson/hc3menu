@@ -6,13 +6,24 @@
 #   2. Run ./scripts/release.sh
 #      - Verifies clean working tree.
 #      - Verifies tag does not already exist.
-#      - Builds arm64 DMG.
+#      - Builds arm64 DMG (always).
+#      - Builds x86_64 DMG if BUILD_X86_64 is not set to 0 and a
+#        .venv-x86_64 venv exists (or Rosetta 2 is available).
 #      - Creates and pushes git tag v<version>.
-#      - Creates GitHub release with auto-generated notes and DMG asset.
+#      - Creates GitHub release with auto-generated notes and DMG assets.
 #
 # Requirements:
 #   - gh CLI (brew install gh) authenticated to github.com.
 #   - Push access to the repo.
+#
+# Intel (x86_64) build requirements (on Apple Silicon):
+#   - Rosetta 2 installed  (softwareupdate --install-rosetta)
+#   - .venv-x86_64 venv with project deps + py2app
+#       arch -x86_64 python3 -m venv .venv-x86_64
+#       source .venv-x86_64/bin/activate && pip install -e . py2app
+#
+# To skip the Intel build:
+#   BUILD_X86_64=0 ./scripts/release.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -25,7 +36,8 @@ fi
 
 VERSION="$(python -c 'from hc3menu.__version__ import __version__; print(__version__)')"
 TAG="v${VERSION}"
-DMG_PATH="dist/HC3-Menu-${VERSION}-arm64.dmg"
+DMG_ARM64="dist/HC3-Menu-${VERSION}-arm64.dmg"
+DMG_X86_64="dist/HC3-Menu-${VERSION}-x86_64.dmg"
 
 echo ">>> Releasing HC3 Menu ${TAG}"
 
@@ -51,12 +63,36 @@ if gh release view "$TAG" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Build the DMG.
-./scripts/build_dmg.sh
+# Decide whether to build the Intel version.
+# Skip if BUILD_X86_64=0 or if Rosetta / x86_64 Python are unavailable.
+BUILD_X86_64="${BUILD_X86_64:-1}"
+if [[ "$BUILD_X86_64" == "1" ]]; then
+    if ! arch -x86_64 true 2>/dev/null; then
+        echo ">>> WARNING: Rosetta 2 not available — skipping x86_64 build."
+        BUILD_X86_64=0
+    fi
+fi
 
-if [[ ! -f "$DMG_PATH" ]]; then
-    echo "ERROR: expected $DMG_PATH not found after build."
+# Build arm64 DMG.
+echo ">>> Building arm64 DMG..."
+TARGET_ARCH=arm64 ./scripts/build_dmg.sh
+
+if [[ ! -f "$DMG_ARM64" ]]; then
+    echo "ERROR: expected $DMG_ARM64 not found after arm64 build."
     exit 1
+fi
+
+# Build x86_64 DMG.
+if [[ "$BUILD_X86_64" == "1" ]]; then
+    echo ">>> Building x86_64 DMG..."
+    VIRTUAL_ENV="" TARGET_ARCH=x86_64 ./scripts/build_dmg.sh
+
+    if [[ ! -f "$DMG_X86_64" ]]; then
+        echo "ERROR: expected $DMG_X86_64 not found after x86_64 build."
+        exit 1
+    fi
+else
+    echo ">>> Skipping x86_64 build (BUILD_X86_64=${BUILD_X86_64})."
 fi
 
 # Tag and push.
@@ -64,16 +100,23 @@ echo ">>> Creating tag $TAG"
 git tag -a "$TAG" -m "Release $TAG"
 git push origin "$TAG"
 
+# Gather DMG assets to attach to the release.
+RELEASE_ASSETS=("$DMG_ARM64")
+[[ "$BUILD_X86_64" == "1" ]] && RELEASE_ASSETS+=("$DMG_X86_64")
+
 # Create the GitHub release.
 echo ">>> Creating GitHub release $TAG"
 gh release create "$TAG" \
     --title "HC3 Menu ${TAG}" \
     --generate-notes \
-    "$DMG_PATH"
+    "${RELEASE_ASSETS[@]}"
 
 echo ""
 echo "==============================================="
 echo "  Released: $TAG"
-echo "  Asset:    $DMG_PATH"
+for asset in "${RELEASE_ASSETS[@]}"; do
+    SIZE=$(du -h "$asset" | cut -f1)
+    echo "  Asset:    $asset  ($SIZE)"
+done
 echo "  URL:      $(gh release view "$TAG" --json url -q .url)"
 echo "==============================================="

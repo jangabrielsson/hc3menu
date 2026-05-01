@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
-# Build a standalone .app and arm64 .dmg for HC3 Menu.
+# Build a standalone .app and .dmg for HC3 Menu.
 #
-# Output: dist/HC3-Menu-<version>-arm64.dmg
+# Output: dist/HC3-Menu-<version>-<arch>.dmg
 #
 # Requirements:
-#   - macOS arm64 (Apple Silicon)
+#   - macOS (arm64 or x86_64)
 #   - Python venv with project deps + py2app installed
 #   - hdiutil (built-in)
+#
+# Architecture:
+#   By default builds for the current machine architecture.
+#   Override via TARGET_ARCH env var (arm64 or x86_64).
+#
+#   Cross-compiling for x86_64 on Apple Silicon requires:
+#     - Rosetta 2 installed  (softwareupdate --install-rosetta)
+#     - An x86_64 Python installation and venv at .venv-x86_64
+#       (create with: arch -x86_64 python3 -m venv .venv-x86_64
+#                      source .venv-x86_64/bin/activate
+#                      pip install -e . py2app)
 #
 # Signing & notarization:
 #   By default the script signs with the developer identity below and
@@ -17,41 +28,76 @@
 #                       set to empty string to skip notarization.
 #
 # Examples:
-#   ./scripts/build_dmg.sh                    # signed + notarized + stapled
+#   ./scripts/build_dmg.sh                              # native arch, signed + notarized
+#   TARGET_ARCH=x86_64 ./scripts/build_dmg.sh           # Intel build (cross-compile)
 #   SIGN_IDENTITY=- NOTARY_PROFILE= ./scripts/build_dmg.sh   # ad-hoc, no notarize
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Detect architecture — arm64 only for v1.
-ARCH="$(uname -m)"
-if [[ "$ARCH" != "arm64" ]]; then
-    echo "ERROR: this build script targets arm64 (Apple Silicon) only."
-    echo "  Current arch: $ARCH"
+# Detect native architecture and resolve target.
+NATIVE_ARCH="$(uname -m)"
+TARGET_ARCH="${TARGET_ARCH:-$NATIVE_ARCH}"
+
+if [[ "$TARGET_ARCH" != "arm64" && "$TARGET_ARCH" != "x86_64" ]]; then
+    echo "ERROR: unsupported TARGET_ARCH '$TARGET_ARCH'. Use 'arm64' or 'x86_64'."
     exit 1
 fi
 
-# Pick up the venv if present.
-if [[ -z "${VIRTUAL_ENV:-}" && -d ".venv" ]]; then
-    # shellcheck disable=SC1091
-    source .venv/bin/activate
+# When cross-compiling (e.g. arm64 host → x86_64 target) we need Rosetta 2
+# and use 'arch -x86_64' to run Python in Intel mode.
+ARCH_PREFIX=""
+if [[ "$TARGET_ARCH" != "$NATIVE_ARCH" ]]; then
+    if ! arch -"$TARGET_ARCH" true 2>/dev/null; then
+        echo "ERROR: cannot run $TARGET_ARCH binaries on this host."
+        echo "  For x86_64 cross-builds, install Rosetta 2:"
+        echo "    softwareupdate --install-rosetta"
+        exit 1
+    fi
+    ARCH_PREFIX="arch -$TARGET_ARCH"
+    echo ">>> Cross-compiling: native=$NATIVE_ARCH  target=$TARGET_ARCH"
+fi
+
+# Pick the appropriate venv:
+#   arm64  → .venv  (default)
+#   x86_64 → .venv-x86_64  (must be created manually for cross-builds)
+if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+    if [[ "$TARGET_ARCH" == "x86_64" && -d ".venv-x86_64" ]]; then
+        # shellcheck disable=SC1091
+        source .venv-x86_64/bin/activate
+    elif [[ -d ".venv" ]]; then
+        # shellcheck disable=SC1091
+        source .venv/bin/activate
+    fi
+fi
+
+# Verify the active Python has the right arch.
+PYTHON_ARCH="$(${ARCH_PREFIX} python -c 'import platform; print(platform.machine())' 2>/dev/null || true)"
+if [[ -n "$PYTHON_ARCH" && "$PYTHON_ARCH" != "$TARGET_ARCH" ]]; then
+    echo "WARNING: active Python reports arch '$PYTHON_ARCH' but TARGET_ARCH='$TARGET_ARCH'."
+    echo "  For x86_64 builds create a dedicated venv:"
+    echo "    arch -x86_64 python3 -m venv .venv-x86_64"
+    echo "    source .venv-x86_64/bin/activate && pip install -e . py2app"
+    echo "  Then re-run: TARGET_ARCH=x86_64 ./scripts/build_dmg.sh"
+    exit 1
 fi
 
 # Read version from the package.
-VERSION="$(python -c 'from hc3menu.__version__ import __version__; print(__version__)')"
-echo ">>> Building HC3 Menu v${VERSION} (arm64)"
+VERSION="$(${ARCH_PREFIX} python -c 'from hc3menu.__version__ import __version__; print(__version__)')"
+echo ">>> Building HC3 Menu v${VERSION} (${TARGET_ARCH})"
 
 # Ensure py2app is available.
-python -c "import py2app" 2>/dev/null || {
+${ARCH_PREFIX} python -c "import py2app" 2>/dev/null || {
     echo ">>> Installing py2app..."
-    pip install py2app
+    ${ARCH_PREFIX} pip install py2app
 }
 
-# Clean previous builds.
-rm -rf build dist
+# Clean py2app's working directory but preserve dist/ so multiple arch
+# DMGs can accumulate there side by side.
+rm -rf build dist/HC3\ Menu.app
 
 echo ">>> Running py2app..."
-python setup.py py2app
+${ARCH_PREFIX} python setup.py py2app
 
 APP_PATH="dist/HC3 Menu.app"
 if [[ ! -d "$APP_PATH" ]]; then
@@ -137,7 +183,7 @@ else
     codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 fi
 
-DMG_NAME="HC3-Menu-${VERSION}-arm64.dmg"
+DMG_NAME="HC3-Menu-${VERSION}-${TARGET_ARCH}.dmg"
 DMG_PATH="dist/${DMG_NAME}"
 STAGING="dist/dmg_staging"
 
