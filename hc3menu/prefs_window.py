@@ -332,14 +332,14 @@ class PreferencesController:
         )
 
         # Filter field
-        view.addSubview_(self._label("Filter:", 20, 360, 50))
-        filter_tf = NSTextField.alloc().initWithFrame_(NSMakeRect(70, 360, 300, 24))
+        view.addSubview_(self._label("Filter:", 20, 340, 50))
+        filter_tf = NSTextField.alloc().initWithFrame_(NSMakeRect(70, 340, 300, 24))
         filter_tf.setTarget_(self._target)
         filter_tf.setAction_("filter:")
         view.addSubview_(filter_tf)
         self._fields["filter"] = filter_tf
 
-        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 20, 580, 330))
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 20, 580, 310))
         scroll.setHasVerticalScroller_(True)
         table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, 580, 330))
 
@@ -379,10 +379,10 @@ class PreferencesController:
 
         view.addSubview_(self._label(
             "Drag rows to reorder. Order is reflected in the menu bar.",
-            20, 360, 560,
+            20, 340, 560,
         ))
 
-        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 60, 580, 290))
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 60, 580, 270))
         scroll.setHasVerticalScroller_(True)
         table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, 580, 290))
 
@@ -423,7 +423,7 @@ class PreferencesController:
         view = item.view()
 
         # Enabled toggle.
-        enabled_btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, 360, 320, 22))
+        enabled_btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, 340, 320, 22))
         enabled_btn.setButtonType_(NSButtonTypeSwitch)
         enabled_btn.setTitle_("Enable global hotkey to open the menu")
         enabled_btn.setState_(1 if self.config.global_hotkey_enabled else 0)

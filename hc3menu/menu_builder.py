@@ -411,26 +411,27 @@ def build_dimmer_item(device: dict, store: StateStore,
 # -- Color picker submenu ----------------------------------------------------
 
 # (label, glyph, r, g, b, w)
+# (label, r, g, b, w)  — icon tinted from RGB; w=255 means warm-white channel
 _COLOR_PRESETS = [
-    ("Red",        "🔴", 255,   0,   0, 0),
-    ("Orange",     "🟠", 255, 110,   0, 0),
-    ("Yellow",     "🟡", 255, 220,   0, 0),
-    ("Green",      "🟢",   0, 255,   0, 0),
-    ("Cyan",       "🔵",   0, 200, 255, 0),
-    ("Blue",       "🔵",   0,   0, 255, 0),
-    ("Purple",     "🟣", 160,   0, 255, 0),
-    ("Pink",       "🟣", 255,   0, 180, 0),
-    ("White",      "⚪", 255, 255, 255, 0),
-    ("Warm white", "🟤",   0,   0,   0, 255),
+    ("Red",        255,   0,   0, 0),
+    ("Orange",     255, 110,   0, 0),
+    ("Yellow",     255, 220,   0, 0),
+    ("Green",        0, 255,   0, 0),
+    ("Cyan",         0, 200, 255, 0),
+    ("Blue",         0,   0, 255, 0),
+    ("Purple",     160,   0, 255, 0),
+    ("Pink",       255,   0, 180, 0),
+    ("White",      255, 255, 255, 0),
+    ("Warm white",   0,   0,   0, 255),
 ]
 
-# CCT presets: (label, glyph, warmWhite, coldWhite)
+# CCT presets: (label, tint_r, tint_g, tint_b, warmWhite, coldWhite)
 _CCT_PRESETS = [
-    ("Warm (2700K)",        "🟤", 255,   0),
-    ("Soft white (3000K)",  "🟤", 200,  60),
-    ("Neutral (4000K)",     "⚪", 130, 130),
-    ("Cool (5000K)",        "⚪",  60, 200),
-    ("Daylight (6500K)",    "⚪",   0, 255),
+    ("Warm (2700K)",       255, 180,  80, 255,   0),
+    ("Soft white (3000K)", 255, 200, 120, 200,  60),
+    ("Neutral (4000K)",    255, 240, 200, 130, 130),
+    ("Cool (5000K)",       220, 235, 255,  60, 200),
+    ("Daylight (6500K)",   200, 220, 255,   0, 255),
 ]
 
 
@@ -523,6 +524,8 @@ def _build_color_submenu(name: str, dev_id: int, props: dict,
     cc = props.get("colorComponents") or {}
     kind = _detect_color_kind(cc)
     root = rumps.MenuItem("Color")
+    if _HAS_APPKIT:
+        _set_icon(root, "paintpalette", color=NSColor.labelColor())
 
     # HC3 user-curated favorite colors come first when available.
     fav_colors = store.all_favorite_colors() if store is not None else []
@@ -532,8 +535,13 @@ def _build_color_submenu(name: str, dev_id: int, props: dict,
         root.add(rumps.separator)
 
     if kind in ("rgb", "rgbw", "unknown"):
-        for label, glyph, r, g, b, w in _COLOR_PRESETS:
-            mi = rumps.MenuItem(f"{glyph}  {label}")
+        for label, r, g, b, w in _COLOR_PRESETS:
+            mi = rumps.MenuItem(label)
+            if _HAS_APPKIT:
+                tint_r, tint_g, tint_b = (r, g, b) if max(r, g, b) >= 16 else (255, 200, 140)
+                tint = NSColor.colorWithSRGBRed_green_blue_alpha_(
+                    tint_r / 255.0, tint_g / 255.0, tint_b / 255.0, 1.0)
+                _set_icon(mi, "circle.fill", color=tint)
             mi.set_callback(
                 lambda _i, r=r, g=g, b=b, w=w:
                 dispatcher.submit(lambda: client.set_color(dev_id, r, g, b, w))
@@ -559,6 +567,8 @@ def _build_color_submenu(name: str, dev_id: int, props: dict,
                 return
             dispatcher.submit(lambda: client.set_color(dev_id, r, g, b, w))
         custom.set_callback(custom_cb)
+        if _HAS_APPKIT:
+            _set_icon(custom, "number", color=NSColor.secondaryLabelColor())
         root.add(custom)
 
         picker_item = rumps.MenuItem("Custom color…")
@@ -596,6 +606,8 @@ def _build_color_submenu(name: str, dev_id: int, props: dict,
             )
 
         picker_item.set_callback(picker_cb)
+        if _HAS_APPKIT:
+            _set_icon(picker_item, "paintbrush", color=NSColor.secondaryLabelColor())
         root.add(picker_item)
 
     if kind in ("cct", "rgbw"):
@@ -625,6 +637,8 @@ def _build_color_submenu(name: str, dev_id: int, props: dict,
             dispatcher.submit(lambda: client.set_color_components(dev_id, comps))
 
         temp_menu = rumps.MenuItem("Color temperature")
+        if _HAS_APPKIT:
+            _set_icon(temp_menu, "thermometer.medium", color=NSColor.labelColor())
         try:
             slider_item = _build_slider_item(
                 init_k, _on_kelvin,
@@ -635,8 +649,12 @@ def _build_color_submenu(name: str, dev_id: int, props: dict,
             temp_menu.add(rumps.separator)
         except Exception as e:
             log.warning("CCT slider unavailable: %s", e)
-        for label, glyph, ww, cw in _CCT_PRESETS:
-            mi = rumps.MenuItem(f"{glyph}  {label}")
+        for label, tr, tg, tb, ww, cw in _CCT_PRESETS:
+            mi = rumps.MenuItem(label)
+            if _HAS_APPKIT:
+                tint = NSColor.colorWithSRGBRed_green_blue_alpha_(
+                    tr / 255.0, tg / 255.0, tb / 255.0, 1.0)
+                _set_icon(mi, "circle.fill", color=tint)
             comps = {"warmWhite": ww, "coldWhite": cw}
             mi.set_callback(
                 lambda _i, c=comps:

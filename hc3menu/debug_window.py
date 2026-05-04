@@ -21,8 +21,10 @@ from AppKit import (
     NSBezelStyleRounded, NSPopUpButton, NSScrollView, NSTableView,
     NSTableColumn, NSObject, NSMakeRect, NSPasteboard,
     NSPasteboardTypeString, NSColor, NSFont, NSAlert,
+    NSViewWidthSizable, NSViewHeightSizable, NSViewMinYMargin, NSViewMaxYMargin,
+    NSAttributedString,
 )
-from Foundation import NSTimer
+from Foundation import NSTimer, NSData
 
 from .config import HC3Credentials
 from .state import StateStore
@@ -30,7 +32,55 @@ from .hc3_client import HC3Client, HC3Error
 
 log = logging.getLogger(__name__)
 
-# Severity filter values (popup index -> set of types accepted).
+# Cache for parsed HTML attributed strings (message text -> NSAttributedString).
+# Keyed by raw message text; bounded to 1000 entries to avoid unbounded growth.
+_ATTR_CACHE: dict[str, object] = {}
+_ATTR_CACHE_MAX = 1000
+
+
+def _html_to_attributed_string(text: str) -> object:
+    """Return NSAttributedString from an HTML message string.
+
+    Uses AppKit's HTML parser so <font color=...>, <b>, <i>, etc. are rendered.
+    Falls back to a plain NSAttributedString if parsing fails or no tags present.
+    Results are cached by raw text to avoid re-parsing identical messages.
+    """
+    if text in _ATTR_CACHE:
+        return _ATTR_CACHE[text]
+
+    # Fast path: no HTML tags — skip the HTML parser entirely.
+    if '<' not in text:
+        result = NSAttributedString.alloc().initWithString_(text)
+        _ATTR_CACHE[text] = result
+        return result
+
+    # Wrap with a monospace font so the visual style matches the table.
+    # AppKit's HTML parser defaults to Times New Roman without this.
+    wrapped = (
+        '<span style="font-family: Menlo, Courier, monospace; font-size: 11px;">'
+        + text
+        + '</span>'
+    )
+    data = NSData.dataWithBytes_length_(wrapped.encode('utf-8'), len(wrapped.encode('utf-8')))
+    try:
+        result = NSAttributedString.alloc().initWithHTML_documentAttributes_(data, None)
+        # PyObjC may return a tuple (attrStr, docAttrs) on some versions.
+        if isinstance(result, tuple):
+            result = result[0]
+    except Exception:
+        result = None
+
+    if result is None or result.length() == 0:
+        result = NSAttributedString.alloc().initWithString_(text)
+
+    if len(_ATTR_CACHE) >= _ATTR_CACHE_MAX:
+        # Evict oldest half when cap reached.
+        for k in list(_ATTR_CACHE.keys())[:_ATTR_CACHE_MAX // 2]:
+            del _ATTR_CACHE[k]
+    _ATTR_CACHE[text] = result
+    return result
+
+
 _SEVERITY_FILTERS = [
     ("All", None),
     ("Errors + warnings", {"error", "warning"}),
@@ -78,7 +128,8 @@ class _DebugTableSource(NSObject):
         if ident == "tag":
             return str(m.get("tag", ""))
         if ident == "message":
-            return str(m.get("message", "")).replace("\n", " ")
+            raw = str(m.get("message", "")).replace("\n", " ")
+            return _html_to_attributed_string(raw)
         return ""
 
 
@@ -143,20 +194,29 @@ class DebugLogController:
         win.setDelegate_(self._target)
 
         cv = win.contentView()
+        cv.setAutoresizesSubviews_(True)
+
+        # Autoresizing mask constants (combined as bitmask):
+        #   NSViewWidthSizable=2, NSViewHeightSizable=16
+        #   NSViewMinYMargin=8  (flexible space below  → pins to top)
+        #   NSViewMaxYMargin=32 (flexible space above  → pins to bottom)
 
         # Top toolbar row.
         # Filter field
         filter_lbl = self._label("Filter:", 12, 484, 50)
+        filter_lbl.setAutoresizingMask_(NSViewMinYMargin)  # pin to top
         cv.addSubview_(filter_lbl)
         filter_tf = NSTextField.alloc().initWithFrame_(NSMakeRect(60, 482, 260, 24))
         filter_tf.setPlaceholderString_("substring (tag or message)")
         filter_tf.setTarget_(self._target)
         filter_tf.setAction_("filterChanged:")
+        filter_tf.setAutoresizingMask_(NSViewMinYMargin)
         cv.addSubview_(filter_tf)
         self._fields["filter"] = filter_tf
 
         # Severity popup
         sev_lbl = self._label("Severity:", 332, 484, 70)
+        sev_lbl.setAutoresizingMask_(NSViewMinYMargin)
         cv.addSubview_(sev_lbl)
         popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
             NSMakeRect(400, 480, 180, 26), False
@@ -166,6 +226,7 @@ class DebugLogController:
         popup.selectItemAtIndex_(0)
         popup.setTarget_(self._target)
         popup.setAction_("severityChanged:")
+        popup.setAutoresizingMask_(NSViewMinYMargin)
         cv.addSubview_(popup)
         self._fields["severity"] = popup
 
@@ -174,6 +235,7 @@ class DebugLogController:
         follow.setButtonType_(NSButtonTypeSwitch)
         follow.setTitle_("Follow tail")
         follow.setState_(1)
+        follow.setAutoresizingMask_(NSViewMinYMargin)
         cv.addSubview_(follow)
         self._fields["follow"] = follow
 
@@ -183,6 +245,7 @@ class DebugLogController:
         refresh.setBezelStyle_(NSBezelStyleRounded)
         refresh.setTarget_(self._target)
         refresh.setAction_("refresh:")
+        refresh.setAutoresizingMask_(NSViewMinYMargin)
         cv.addSubview_(refresh)
 
         # Table
@@ -191,6 +254,8 @@ class DebugLogController:
         scroll.setHasHorizontalScroller_(False)
         scroll.setBorderType_(2)  # NSBezelBorder
         scroll.setAutohidesScrollers_(False)
+        # Grow in both dimensions, stay pinned away from top toolbar and bottom buttons.
+        scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
 
         table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, 796, 416))
         table.setUsesAlternatingRowBackgroundColors_(True)
@@ -219,12 +284,13 @@ class DebugLogController:
         self._fields["table"] = table
         self._fields["scroll"] = scroll
 
-        # Bottom buttons
+        # Bottom buttons — pin to bottom (flexible top margin)
         copy_btn = NSButton.alloc().initWithFrame_(NSMakeRect(12, 14, 110, 30))
         copy_btn.setTitle_("Copy selected")
         copy_btn.setBezelStyle_(NSBezelStyleRounded)
         copy_btn.setTarget_(self._target)
         copy_btn.setAction_("copySelected:")
+        copy_btn.setAutoresizingMask_(NSViewMaxYMargin)
         cv.addSubview_(copy_btn)
 
         copy_all = NSButton.alloc().initWithFrame_(NSMakeRect(128, 14, 90, 30))
@@ -232,6 +298,7 @@ class DebugLogController:
         copy_all.setBezelStyle_(NSBezelStyleRounded)
         copy_all.setTarget_(self._target)
         copy_all.setAction_("copyAll:")
+        copy_all.setAutoresizingMask_(NSViewMaxYMargin)
         cv.addSubview_(copy_all)
 
         open_qa = NSButton.alloc().initWithFrame_(NSMakeRect(228, 14, 130, 30))
@@ -239,6 +306,7 @@ class DebugLogController:
         open_qa.setBezelStyle_(NSBezelStyleRounded)
         open_qa.setTarget_(self._target)
         open_qa.setAction_("openQA:")
+        open_qa.setAutoresizingMask_(NSViewMaxYMargin)
         cv.addSubview_(open_qa)
 
         clear_btn = NSButton.alloc().initWithFrame_(NSMakeRect(620, 14, 90, 30))
@@ -246,6 +314,7 @@ class DebugLogController:
         clear_btn.setBezelStyle_(NSBezelStyleRounded)
         clear_btn.setTarget_(self._target)
         clear_btn.setAction_("clearHC3:")
+        clear_btn.setAutoresizingMask_(NSViewMaxYMargin)
         cv.addSubview_(clear_btn)
 
         close_btn = NSButton.alloc().initWithFrame_(NSMakeRect(716, 14, 90, 30))
@@ -253,6 +322,7 @@ class DebugLogController:
         close_btn.setBezelStyle_(NSBezelStyleRounded)
         close_btn.setTarget_(self._target)
         close_btn.setAction_("closeWindow:")
+        close_btn.setAutoresizingMask_(NSViewMaxYMargin)
         cv.addSubview_(close_btn)
 
         return win
