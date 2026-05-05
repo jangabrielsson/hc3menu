@@ -9,6 +9,7 @@ No third-party deps beyond ``requests`` (already used by the HC3 client).
 from __future__ import annotations
 
 import logging
+import platform
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -68,12 +69,22 @@ def check_for_update(timeout: float = 6.0) -> Optional[UpdateInfo]:
     current = __version__
     is_newer = _parse_semver(latest) > _parse_semver(current)
 
+    # Prefer the DMG that matches the running architecture (arm64 / x86_64).
+    machine = platform.machine()  # 'arm64' on Apple Silicon, 'x86_64' on Intel
     dmg_url: Optional[str] = None
+    fallback_url: Optional[str] = None
     for asset in data.get("assets") or []:
         n = str(asset.get("name") or "")
-        if n.lower().endswith(".dmg"):
-            dmg_url = asset.get("browser_download_url")
+        if not n.lower().endswith(".dmg"):
+            continue
+        url = asset.get("browser_download_url")
+        if machine in n:
+            dmg_url = url
             break
+        if fallback_url is None:
+            fallback_url = url
+    if dmg_url is None:
+        dmg_url = fallback_url
 
     return UpdateInfo(
         current=current,
