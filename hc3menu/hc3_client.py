@@ -22,6 +22,13 @@ class HC3Client:
         self.request_timeout = request_timeout
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth(creds.user, creds.password)
+        # HC3 boxes use self-signed TLS certificates, so verification must be
+        # disabled when HTTPS is enabled. This is intentional and expected for
+        # local LAN-only devices.
+        if creds.https:
+            self.session.verify = False
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",

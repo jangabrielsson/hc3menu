@@ -192,6 +192,23 @@ class _PrefsTarget(NSObject):
     def test_(self, _sender):  # noqa: N802
         self._outer._do_test()
 
+    def httpsToggled_(self, sender):  # noqa: N802
+        outer = self._outer
+        port_tf = outer._fields.get("port")
+        if port_tf is None:
+            return
+        https_on = bool(sender.state())
+        try:
+            current_port = int(port_tf.stringValue().strip())
+        except (ValueError, AttributeError):
+            current_port = None
+        # Auto-switch between default HTTP (80) and HTTPS (443) ports only
+        # when the user hasn't entered a custom port.
+        if https_on and current_port == 80:
+            port_tf.setStringValue_("443")
+        elif not https_on and current_port == 443:
+            port_tf.setStringValue_("80")
+
     def filter_(self, sender):  # noqa: N802
         outer = self._outer
         if outer._table_source is not None:
@@ -310,6 +327,8 @@ class PreferencesController:
         https_btn.setButtonType_(NSButtonTypeSwitch)
         https_btn.setTitle_("Enable")
         https_btn.setState_(1 if self.creds.https else 0)
+        https_btn.setTarget_(self._target)
+        https_btn.setAction_("httpsToggled:")
         view.addSubview_(https_btn)
         self._fields["https"] = https_btn
 
