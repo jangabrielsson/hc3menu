@@ -50,6 +50,21 @@ def _make_favorite_item(dev_id: int, is_fav: bool,
     return item
 
 
+def _make_device_struct_item(device: dict) -> rumps.MenuItem:
+    """Build a 'Device struct…' submenu entry that shows the raw JSON."""
+    item = rumps.MenuItem("Device struct…")
+    _set_icon(item, "doc.text.magnifyingglass")
+    # Capture a shallow copy so menu rebuilds don't mutate it mid-display.
+    _dev = dict(device)
+
+    def cb(_):
+        from .device_struct_window import show_device_struct
+        show_device_struct(_dev)
+
+    item.set_callback(cb)
+    return item
+
+
 def _build_slider_item(initial: int, on_change: Callable[[int], None],
                        *, min_v: int = 0, max_v: int = 100,
                        unit: str = "%", step: int = 5,
@@ -291,6 +306,8 @@ def build_switch_item(device: dict, store: StateStore,
     if fav is not None:
         parent.add(rumps.separator)
         parent.add(fav)
+    parent.add(rumps.separator)
+    parent.add(_make_device_struct_item(device))
     return parent
 
 
@@ -405,6 +422,8 @@ def build_dimmer_item(device: dict, store: StateStore,
     if fav is not None:
         parent.add(rumps.separator)
         parent.add(fav)
+    parent.add(rumps.separator)
+    parent.add(_make_device_struct_item(device))
     return parent
 
 
@@ -764,6 +783,8 @@ def build_shutter_item(device: dict, store: StateStore,
     if fav is not None:
         parent.add(rumps.separator)
         parent.add(fav)
+    parent.add(rumps.separator)
+    parent.add(_make_device_struct_item(device))
     return parent
 
 
@@ -823,6 +844,7 @@ def build_sensor_item(device: dict, kind: str,
     else:
         # Give a no-op callback so the row is not greyed out.
         item.set_callback(lambda _i: None)
+    item.add(_make_device_struct_item(device))
     return item
 
 
@@ -877,6 +899,8 @@ def build_thermostat_item(device: dict, store: StateStore,
     if fav is not None:
         parent.add(rumps.separator)
         parent.add(fav)
+    parent.add(rumps.separator)
+    parent.add(_make_device_struct_item(device))
     return parent
 
 

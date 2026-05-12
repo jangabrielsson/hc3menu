@@ -104,3 +104,80 @@ Requires Pillow.
 ```sh
 pytest
 ```
+
+---
+
+## AppleScript Integration (future)
+
+HC3 Menu currently has no AppleScript dictionary. Options evaluated below, ranked by effort/value.
+
+### Option A — CLI companion (`hc3` command) ✅ Recommended first step
+
+A thin Python CLI (`hc3menu/cli.py`) that queries the local HTTP API (port 34562) and
+outputs JSON or plain text. Installed as a symlink at `/usr/local/bin/hc3`.
+
+```applescript
+-- List devices needing attention, plain text
+set result to do shell script "/usr/local/bin/hc3 attention --format text"
+
+-- Turn a device on/off
+do shell script "/usr/local/bin/hc3 device 42 on"
+do shell script "/usr/local/bin/hc3 device 42 off"
+
+-- Set brightness
+do shell script "/usr/local/bin/hc3 device 42 level 75"
+
+-- Run a scene
+do shell script "/usr/local/bin/hc3 scene 7 run"
+
+-- Full device JSON
+set json to do shell script "/usr/local/bin/hc3 devices --format json"
+```
+
+Requires the local API to be enabled in `~/.hc3menu/config.json`:
+```json
+{ "local_api_port": 34562 }
+```
+
+Also works from Terminal, Automator "Run Shell Script", and the macOS Shortcuts
+"Run Shell Script" action with no additional setup.
+
+---
+
+### Option B — Native AppleScript dictionary (`NSScriptability`)
+
+Implement a `.sdef` (Script Definition) XML file plus `NSScriptCommand` PyObjC subclasses
+so HC3 Menu becomes a first-class AppleScript target, discoverable in Script Editor.
+
+```applescript
+tell application "HC3 Menu"
+    turn on device id 42
+    turn off device id 42
+    run scene id 7
+    get attention devices
+    get every device
+end tell
+```
+
+**Steps required:**
+
+1. Write `HC3Menu.sdef` (XML) declaring classes (`device`, `scene`, …) and commands
+   (`turn on`, `turn off`, `set level`, `run scene`, …).
+2. Register in `Info.plist`:
+   - `NSAppleScriptEnabled` = `YES`
+   - `OSAScriptingDefinition` = `HC3Menu.sdef`
+3. Subclass `NSScriptCommand` for each verb; implement `performDefaultImplementation`.
+   Wire properties via `NSScriptClassDescription` / `copyScriptingValue:forKey:withProperties:`.
+4. Wire into the app via bundle auto-discovery or `NSApplication.setScriptingDefinition_`.
+
+**Pro:** First-class AppleScript citizen, no local API needed, fully discoverable.  
+**Con:** Significant boilerplate; PyObjC `NSScriptability` binding is sparsely documented.
+
+Reference: [Cocoa Scripting Guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ScriptableCocoaApplications/)
+
+---
+
+### Option C — Raw Apple Events (`NSAppleEventManager`)
+
+Register 4-char-code event/class pairs and dispatch them manually. Works, but call syntax
+from AppleScript is opaque (`«event HC3Mdevl»`). Not recommended.

@@ -64,6 +64,8 @@ class AppConfig:
     global_hotkey_enabled: bool = False
     # Human-readable chord, parsed by global_hotkey.parse_chord().
     global_hotkey: str = "ctrl+alt+cmd+H"
+    # Local HTTP API server port (127.0.0.1 only). Set to 0 to disable (default).
+    local_api_port: int = 0
 
 
 def _ensure_dirs() -> None:
@@ -131,6 +133,7 @@ def load_config() -> AppConfig:
         auto_update_last_check=float(data.get("auto_update_last_check", 0.0)),
         global_hotkey_enabled=bool(data.get("global_hotkey_enabled", False)),
         global_hotkey=str(data.get("global_hotkey", "ctrl+alt+cmd+H")),
+        local_api_port=int(data.get("local_api_port", 0)),
     )
 
 
@@ -150,5 +153,6 @@ def save_config(cfg: AppConfig) -> None:
         "auto_update_last_check": cfg.auto_update_last_check,
         "global_hotkey_enabled": cfg.global_hotkey_enabled,
         "global_hotkey": cfg.global_hotkey,
+        "local_api_port": cfg.local_api_port,
     }
     CONFIG_FILE.write_text(json.dumps(payload, indent=2))

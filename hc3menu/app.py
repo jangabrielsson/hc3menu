@@ -1,6 +1,7 @@
 """Main rumps app: wires together client, state, poller, menu, prefs, notifications."""
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,7 @@ from .__version__ import __version__
 from . import updater
 from .hc3_client import HC3Client, HC3Error
 from .menu_builder import MenuActionDispatcher, build_root_menu
+from .local_api import LocalAPIServer
 from .notifications import Notifier
 from .state import RefreshPoller, StateStore, UIEventQueue
 
@@ -34,11 +36,24 @@ class HC3MenuApp(rumps.App):
         )
         self._action_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hc3-action")
         self._lock = threading.Lock()
+        self._local_api = LocalAPIServer(
+            self.store, lambda: self.client,
+            port=self.config.local_api_port,
+        )
+        if self.config.local_api_port > 0:
+            self._local_api.start()
         self._prefs_ctrl = None  # PreferencesController; created lazily
         self._debug_ctrl = None  # DebugLogController; created lazily
         self._search_ctrl = None  # SearchController; created lazily
         # Per-QA-tag throttle: tag -> last notify monotonic timestamp.
         self._qa_error_last_notify: dict[str, float] = {}
+        # Rebuild throttle: coalesce rapid device-change events into one rebuild
+        # per 3 s to avoid creating thousands of PyObjC NSMenuItem objects/hour.
+        self._rebuild_pending: bool = False
+        self._last_rebuild_ts: float = 0.0
+        # GC cadence: break Python↔ObjC reference cycles that accumulate from
+        # each rebuild (closures capturing rumps.MenuItem objects).
+        self._last_gc_ts: float = 0.0
 
         self.dispatcher = MenuActionDispatcher(self._submit_action)
 
@@ -126,6 +141,7 @@ class HC3MenuApp(rumps.App):
             self.poller.stop()
             self.poller = None
         self.client = None
+        self._local_api.stop()
 
     # -- Menu management --------------------------------------------------
     def _build_initial_menu(self) -> None:
@@ -708,6 +724,7 @@ class HC3MenuApp(rumps.App):
                 diag = None
             if diag is not None:
                 self.store.update_diagnostics(diag)
+            debug_added = 0
             try:
                 # Fetch all severities so the Debug log window can filter
                 # locally (trace/debug/info as well as warning/error). The
@@ -716,16 +733,21 @@ class HC3MenuApp(rumps.App):
                 msgs = resp.get("messages") or []
                 # Detect new errors (only after first poll has happened).
                 already_initialized = bool(self.store.recent_debug_messages(1))
-                added = self.store.merge_debug_messages(msgs)
-                if added and already_initialized:
-                    new_errors = [m for m in self.store.recent_debug_messages(added)
+                debug_added = self.store.merge_debug_messages(msgs)
+                if debug_added and already_initialized:
+                    new_errors = [m for m in self.store.recent_debug_messages(debug_added)
                                   if m.get("type") == "error"]
                     if self.config.qa_error_notifications:
                         for m in new_errors[:3]:  # cap to 3 notifications/cycle
                             self._notify_qa_error(m)
             except HC3Error as e:
                 log.debug("debug messages fetch failed: %s", e)
-            self.ui_queue.put(("rebuild", None))
+            # Only trigger a rebuild when diagnostics or debug messages actually
+            # changed.  Previously this was unconditional (every 10 s), which
+            # generated a steady stream of menu rebuilds even during idle periods
+            # and was the primary driver of the long-running memory/CPU leak.
+            if diag is not None or debug_added:
+                self.ui_queue.put(("rebuild", None))
         self._action_pool.submit(work)
 
     def _notify_qa_error(self, msg: dict) -> None:
@@ -898,23 +920,34 @@ class HC3MenuApp(rumps.App):
         self._action_pool.submit(wrapped)
 
     def _tick_ui(self, _) -> None:
+        import time as _t
         items = self.ui_queue.drain()
-        if not items:
-            return
-        # Handle update-result events independently from menu rebuilds.
-        for kind, payload in items:
+        # Handle update-result events immediately (not subject to throttle).
+        for kind, payload in (items or []):
             if kind == "update_result":
                 self._show_update_result(payload)
-        # Coalesce: any change → single rebuild
-        change_count = sum(1 for kind, _ in items if kind == "change")
-        rebuild_req = any(kind == "rebuild" for kind, _ in items)
-        if change_count or rebuild_req:
-            log.info("ui tick: rebuilding menu (changes=%d, manual_refresh=%s)",
-                     change_count, rebuild_req)
-            try:
-                self._rebuild_menu()
-            except Exception:
-                log.exception("menu rebuild failed")
+            elif kind in ("change", "rebuild"):
+                self._rebuild_pending = True
+        # Throttle: at most one full menu rebuild every 3 seconds.  Frequent
+        # sensor events (temperature, motion, …) can arrive many times per
+        # minute; each rebuild allocates hundreds of PyObjC NSMenuItem objects
+        # and, without throttling, those accumulate to GBs over days.
+        if self._rebuild_pending:
+            now = _t.monotonic()
+            if now - self._last_rebuild_ts >= 3.0:
+                self._rebuild_pending = False
+                self._last_rebuild_ts = now
+                log.info("ui tick: rebuilding menu")
+                try:
+                    self._rebuild_menu()
+                except Exception:
+                    log.exception("menu rebuild failed")
+        # Periodic explicit GC to break Python↔ObjC reference cycles that
+        # accumulate from closures captured inside rebuilt menu items.
+        now = _t.monotonic()
+        if now - self._last_gc_ts >= 60.0:
+            self._last_gc_ts = now
+            gc.collect()
 
     # -- Preferences ------------------------------------------------------
     def open_prefs(self, _) -> None:
