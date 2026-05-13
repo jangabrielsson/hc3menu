@@ -19,7 +19,27 @@ except ImportError:  # pragma: no cover
     _HAS_SYMBOL_CONFIG = False
 
 
+# Cache keyed by (name, r, g, b, a, template) so that distinct NSColor
+# objects with the same RGBA value share the same cached NSImage.  The old
+# key used id(color), which is unique per Python object — so dynamically
+# created colors (e.g. colorWithSRGBRed:green:blue:alpha:) never hit the
+# cache and it grew without bound (one NSImage per color × per device ×
+# per rebuild ≈ gigabytes after days of running).
 _CACHE: dict[tuple, NSImage] = {}
+_CACHE_MAX = 512  # hard cap; evict oldest half when reached
+
+
+def _color_key(color: NSColor) -> tuple:
+    """Return a stable hashable key for an NSColor."""
+    try:
+        r = float(color.redComponent())
+        g = float(color.greenComponent())
+        b = float(color.blueComponent())
+        a = float(color.alphaComponent())
+        return (round(r, 4), round(g, 4), round(b, 4), round(a, 4))
+    except Exception:
+        # Fallback for pattern/catalog colors that don't expose RGBA.
+        return (id(color),)
 
 
 def sf_image(name: str,
@@ -31,7 +51,7 @@ def sf_image(name: str,
     - `color`: optional NSColor for palette tint (macOS 12+)
     - `template`: if True and no color, tints with menu text color automatically
     """
-    key = (name, id(color) if color is not None else None, template)
+    key = (name, _color_key(color) if color is not None else None, template)
     cached = _CACHE.get(key)
     if cached is not None:
         return cached
@@ -51,5 +71,9 @@ def sf_image(name: str,
     elif template:
         img.setTemplate_(True)
 
+    if len(_CACHE) >= _CACHE_MAX:
+        # Evict oldest half to keep memory bounded.
+        for k in list(_CACHE.keys())[:_CACHE_MAX // 2]:
+            del _CACHE[k]
     _CACHE[key] = img
     return img

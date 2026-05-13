@@ -928,13 +928,13 @@ class HC3MenuApp(rumps.App):
                 self._show_update_result(payload)
             elif kind in ("change", "rebuild"):
                 self._rebuild_pending = True
-        # Throttle: at most one full menu rebuild every 3 seconds.  Frequent
+        # Throttle: at most one full menu rebuild every 10 seconds.  Frequent
         # sensor events (temperature, motion, …) can arrive many times per
         # minute; each rebuild allocates hundreds of PyObjC NSMenuItem objects
         # and, without throttling, those accumulate to GBs over days.
         if self._rebuild_pending:
             now = _t.monotonic()
-            if now - self._last_rebuild_ts >= 3.0:
+            if now - self._last_rebuild_ts >= 10.0:
                 self._rebuild_pending = False
                 self._last_rebuild_ts = now
                 log.info("ui tick: rebuilding menu")
