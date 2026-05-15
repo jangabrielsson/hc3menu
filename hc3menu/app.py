@@ -47,9 +47,17 @@ class HC3MenuApp(rumps.App):
         self._search_ctrl = None  # SearchController; created lazily
         # Per-QA-tag throttle: tag -> last notify monotonic timestamp.
         self._qa_error_last_notify: dict[str, float] = {}
-        # Rebuild throttle: coalesce rapid device-change events into one rebuild
-        # per 3 s to avoid creating thousands of PyObjC NSMenuItem objects/hour.
+        # Rebuild throttle — two tiers:
+        #   _rebuild_pending   = urgent (alarm state, profile, diagnostics, manual refresh)
+        #                        fires within ~2 s of the event.
+        #   _lazy_rebuild_pending = device value changes (sensor readings, lights, …)
+        #                        fires at most once per 5 minutes.  The store is
+        #                        always up-to-date, so the menu shows correct values
+        #                        on the next rebuild regardless of when it happens.
+        # Without this split every sensor tick triggered a full NSMenuItem tree
+        # rebuild (≈ thousands/day) which accumulated GB of ObjC objects.
         self._rebuild_pending: bool = False
+        self._lazy_rebuild_pending: bool = False
         self._last_rebuild_ts: float = 0.0
         # GC cadence: break Python↔ObjC reference cycles that accumulate from
         # each rebuild (closures capturing rumps.MenuItem objects).
@@ -919,6 +927,9 @@ class HC3MenuApp(rumps.App):
                 app_crashes.report("action-pool", *sys.exc_info())
         self._action_pool.submit(wrapped)
 
+    _URGENT_REBUILD_INTERVAL = 2.0    # seconds between urgent rebuilds
+    _LAZY_REBUILD_INTERVAL   = 300.0  # seconds between lazy (device value) rebuilds
+
     def _tick_ui(self, _) -> None:
         import time as _t
         items = self.ui_queue.drain()
@@ -926,25 +937,46 @@ class HC3MenuApp(rumps.App):
         for kind, payload in (items or []):
             if kind == "update_result":
                 self._show_update_result(payload)
-            elif kind in ("change", "rebuild"):
+            elif kind == "rebuild":
+                # Structural change: alarm, profile, diagnostics, manual refresh.
                 self._rebuild_pending = True
-        # Throttle: at most one full menu rebuild every 10 seconds.  Frequent
-        # sensor events (temperature, motion, …) can arrive many times per
-        # minute; each rebuild allocates hundreds of PyObjC NSMenuItem objects
-        # and, without throttling, those accumulate to GBs over days.
-        if self._rebuild_pending:
-            now = _t.monotonic()
-            if now - self._last_rebuild_ts >= 10.0:
-                self._rebuild_pending = False
-                self._last_rebuild_ts = now
-                log.info("ui tick: rebuilding menu")
-                try:
-                    self._rebuild_menu()
-                except Exception:
-                    log.exception("menu rebuild failed")
+            elif kind == "change":
+                # Device value update: store is already current; just note that
+                # the menu is stale and let the lazy tier pick it up.
+                self._lazy_rebuild_pending = True
+
+        now = _t.monotonic()
+        did_rebuild = False
+
+        # Urgent tier: alarm/profile/manual-refresh events rebuild within ~2 s.
+        if self._rebuild_pending and now - self._last_rebuild_ts >= self._URGENT_REBUILD_INTERVAL:
+            self._rebuild_pending = False
+            self._lazy_rebuild_pending = False  # urgent subsumes any pending lazy
+            self._last_rebuild_ts = now
+            log.info("ui tick: urgent rebuild")
+            try:
+                self._rebuild_menu()
+            except Exception:
+                log.exception("menu rebuild failed")
+            did_rebuild = True
+
+        # Lazy tier: device value changes rebuild at most once per 5 minutes.
+        # Thousands of sensor events per day previously caused thousands of full
+        # menu-tree rebuilds, accumulating GB of unreleased PyObjC NSMenuItem
+        # objects.  5-minute staleness is acceptable — values are read fresh
+        # from the store whenever a rebuild actually runs.
+        if not did_rebuild and self._lazy_rebuild_pending and \
+                now - self._last_rebuild_ts >= self._LAZY_REBUILD_INTERVAL:
+            self._lazy_rebuild_pending = False
+            self._last_rebuild_ts = now
+            log.info("ui tick: lazy rebuild (device values stale)")
+            try:
+                self._rebuild_menu()
+            except Exception:
+                log.exception("menu rebuild failed")
+
         # Periodic explicit GC to break Python↔ObjC reference cycles that
         # accumulate from closures captured inside rebuilt menu items.
-        now = _t.monotonic()
         if now - self._last_gc_ts >= 60.0:
             self._last_gc_ts = now
             gc.collect()
