@@ -161,6 +161,11 @@ class HC3MenuApp(rumps.App):
     def _rebuild_menu(self) -> None:
         if self.client is None:
             return
+        # Rotate slider-target buckets: releases targets from 2+ rebuilds ago
+        # so their NSObjects (NSView/NSSlider) are freed when the previous
+        # NSMenu items are cleared below.
+        from . import slider_view as _sv
+        _sv.begin_rebuild()
         self.menu.clear()
         items = build_root_menu(
             self.store, self.config.favorites,
@@ -754,8 +759,12 @@ class HC3MenuApp(rumps.App):
             # changed.  Previously this was unconditional (every 10 s), which
             # generated a steady stream of menu rebuilds even during idle periods
             # and was the primary driver of the long-running memory/CPU leak.
+            # Use a *lazy* rebuild (5-minute cadence) so diagnostics/debug data
+            # is fresh on the next natural rebuild without driving continuous
+            # full NSMenuItem tree recreation.  Error notifications are sent
+            # immediately (above) regardless of rebuild scheduling.
             if diag is not None or debug_added:
-                self.ui_queue.put(("rebuild", None))
+                self.ui_queue.put(("change", None))
         self._action_pool.submit(work)
 
     def _notify_qa_error(self, msg: dict) -> None:

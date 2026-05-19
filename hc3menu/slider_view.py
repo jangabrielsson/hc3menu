@@ -16,7 +16,26 @@ from AppKit import (
 from Foundation import NSObject
 
 # Keep strong refs so PyObjC targets aren't garbage-collected.
-_TARGETS: list[object] = []
+# Two-bucket rotation: _TARGETS_PREV holds the most-recently-displayed
+# menu's targets (still safe to keep alive), _TARGETS_CURR holds the
+# targets for the menu currently being built.  When begin_rebuild() is
+# called at the start of each _rebuild_menu(), the previous-previous
+# bucket is freed (its menu items have long since been removed from the
+# NSMenu hierarchy and no slider will ever fire on them again).
+_TARGETS_CURR: list[object] = []
+_TARGETS_PREV: list[object] = []
+
+
+def begin_rebuild() -> None:
+    """Call once at the start of each menu rebuild to rotate target buckets.
+
+    Targets from two builds ago are released here — their NSMenuItems were
+    already removed from the NSMenu during the intervening rebuild, so no
+    slider callback can fire on them.
+    """
+    global _TARGETS_PREV, _TARGETS_CURR
+    _TARGETS_PREV = _TARGETS_CURR   # keep most-recent build's targets alive
+    _TARGETS_CURR = []              # new build starts with an empty bucket
 
 
 class _SliderTarget(NSObject):
@@ -91,7 +110,7 @@ def make_slider_view(initial: int, on_change: Callable[[int], None],
     target = _SliderTarget.alloc().initWithCallback_label_unit_step_(
         on_change, label, unit, step)
     target.setExtremes_((min_v, max_v))
-    _TARGETS.append(target)  # keep alive
+    _TARGETS_CURR.append(target)  # keep alive until next two rebuilds
     slider.setTarget_(target)
     slider.setAction_("sliderChanged:")
     container.addSubview_(slider)
