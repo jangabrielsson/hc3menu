@@ -11,7 +11,7 @@ import rumps
 from .config import AppConfig, HC3Credentials, load_config, load_credentials, save_config
 from .__version__ import __version__
 from . import updater
-from .hc3_client import HC3Client, HC3Error
+from .hc3_client import HC3Client, HC3AuthError, HC3Error
 from .menu_builder import MenuActionDispatcher, build_root_menu
 from .local_api import LocalAPIServer
 from .notifications import Notifier
@@ -59,6 +59,11 @@ class HC3MenuApp(rumps.App):
         self._rebuild_pending: bool = False
         self._lazy_rebuild_pending: bool = False
         self._last_rebuild_ts: float = 0.0
+        # Auth-failure guard: set when HC3 rejects credentials (401/403).
+        # While True, automatic reconnect attempts are suppressed to avoid
+        # triggering the HC3 brute-force lockout (3 failures = blocked for minutes).
+        # Cleared when the user saves new credentials via Preferences.
+        self._auth_blocked: bool = False
         # GC cadence: break Python↔ObjC reference cycles that accumulate from
         # each rebuild (closures capturing rumps.MenuItem objects).
         self._last_gc_ts: float = 0.0
@@ -104,6 +109,15 @@ class HC3MenuApp(rumps.App):
             self.client = HC3Client(self.creds)
             devices = self.client.get_devices()
             rooms = self.client.get_rooms()
+        except HC3AuthError as e:
+            self._auth_blocked = True
+            self.client = None
+            rumps.alert(
+                "HC3 authentication failed",
+                f"{e}\n\nPolling has been stopped to protect your account.\n"
+                "Open Preferences… to correct your credentials.",
+            )
+            return
         except HC3Error as e:
             rumps.alert("HC3 connection failed", str(e))
             return
@@ -139,6 +153,7 @@ class HC3MenuApp(rumps.App):
             on_change=self._on_change_bg,
             poll_timeout_sec=self.config.poll_timeout_sec,
             on_connection_change=self._on_connection_change,
+            on_auth_failure=self._on_auth_failure,
         )
         self.poller.start()
         self.store.set_connected(True)
@@ -733,7 +748,7 @@ class HC3MenuApp(rumps.App):
 
     # -- Diagnostics tick ------------------------------------------------
     def _tick_diag(self, _) -> None:
-        if self.client is None:
+        if self.client is None or self._auth_blocked:
             return
         def work():
             try:
@@ -796,6 +811,24 @@ class HC3MenuApp(rumps.App):
             log.debug("notification failed", exc_info=True)
 
     # -- Connection state ------------------------------------------------
+    def _on_auth_failure(self) -> None:
+        """Called (from poller thread) when HC3 rejects our credentials.
+
+        Sets the auth-blocked flag so no further automatic calls are made,
+        then surfaces a notification asking the user to fix their credentials.
+        """
+        self._auth_blocked = True
+        log.error("HC3 authentication failed — stopping all polling")
+        try:
+            rumps.notification(
+                title="HC3 authentication failed",
+                subtitle="Polling stopped",
+                message="Open Preferences… to correct your credentials.",
+            )
+        except Exception:
+            log.debug("notification failed", exc_info=True)
+        self.ui_queue.put(("rebuild", None))
+
     def _on_connection_change(self, connected: bool) -> None:
         log.info("connection state -> %s", "connected" if connected else "disconnected")
         try:
@@ -1018,6 +1051,8 @@ class HC3MenuApp(rumps.App):
             self.notifier.set_rules(cfg.notifications)
             # Re-apply global hotkey settings (chord may have changed).
             self._apply_global_hotkey_config()
+            # Clear any previous auth-failure block so _start_session will try again.
+            self._auth_blocked = False
             # Rebuild menu so the hotkey label and toggle states reflect changes.
             self.ui_queue.put(("rebuild", None))
             self._start_session()

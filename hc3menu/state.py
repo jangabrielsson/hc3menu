@@ -8,7 +8,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Optional
 
-from .hc3_client import HC3Client, HC3Error
+from .hc3_client import HC3Client, HC3AuthError, HC3Error
 
 log = logging.getLogger(__name__)
 
@@ -228,11 +228,13 @@ class RefreshPoller:
                  on_change: Callable[[dict], None],
                  poll_timeout_sec: int = 35,
                  error_backoff_sec: float = 5.0,
-                 on_connection_change: Optional[Callable[[bool], None]] = None) -> None:
+                 on_connection_change: Optional[Callable[[bool], None]] = None,
+                 on_auth_failure: Optional[Callable[[], None]] = None) -> None:
         self._client = client
         self._store = store
         self._on_change = on_change
         self._on_connection_change = on_connection_change
+        self._on_auth_failure = on_auth_failure
         self._poll_timeout = poll_timeout_sec
         self._error_backoff = error_backoff_sec
         self._stop = threading.Event()
@@ -288,6 +290,18 @@ class RefreshPoller:
                     else:
                         # Forward other events with type so caller can log/ignore
                         self._safe_emit({"_event_type": etype, **edata})
+            except HC3AuthError as e:
+                # Wrong credentials — stop immediately to avoid triggering
+                # the HC3 brute-force lockout (3 failures = blocked for minutes).
+                log.error("refreshStates auth failure: %s — poller stopped", e)
+                self._store.set_connected(False, str(e))
+                if self._on_connection_change:
+                    try: self._on_connection_change(False)
+                    except Exception: log.exception("on_connection_change raised")
+                if self._on_auth_failure:
+                    try: self._on_auth_failure()
+                    except Exception: log.exception("on_auth_failure raised")
+                break  # Do NOT retry — wait for user to fix credentials.
             except HC3Error as e:
                 log.warning("refreshStates error: %s", e)
                 self._consecutive_errors += 1

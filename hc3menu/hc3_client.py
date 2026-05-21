@@ -16,6 +16,15 @@ class HC3Error(Exception):
     """Raised for HC3 API failures."""
 
 
+class HC3AuthError(HC3Error):
+    """Raised when the HC3 rejects credentials (HTTP 401 or 403).
+
+    The caller should stop retrying immediately and prompt the user to
+    fix their credentials — three failed attempts cause the HC3 to block
+    the user account for several minutes.
+    """
+
+
 class HC3Client:
     def __init__(self, creds: HC3Credentials, request_timeout: float = 10.0):
         self.creds = creds
@@ -52,6 +61,10 @@ class HC3Client:
             )
         except requests.RequestException as e:
             raise HC3Error(f"{method} {path} failed: {e}") from e
+        if resp.status_code in (401, 403):
+            raise HC3AuthError(
+                f"{method} {path} -> HTTP {resp.status_code}: authentication failed"
+            )
         if resp.status_code >= 400:
             raise HC3Error(f"{method} {path} -> HTTP {resp.status_code}: {resp.text[:200]}")
         if not resp.content:
