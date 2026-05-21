@@ -167,6 +167,12 @@ class HC3MenuApp(rumps.App):
         from . import slider_view as _sv
         _sv.begin_rebuild()
         self.menu.clear()
+        # Force a GC cycle immediately after discarding the old menu tree so
+        # that closure↔MenuItem reference cycles (PyObjC wrappers for the
+        # just-cleared NSMenuItems) are broken before new items are allocated.
+        # Without this, cycles accumulate between the 20-second periodic GC
+        # ticks and the slow growth adds up over days.
+        gc.collect()
         items = build_root_menu(
             self.store, self.config.favorites,
             self.dispatcher, self.client,
@@ -986,7 +992,9 @@ class HC3MenuApp(rumps.App):
 
         # Periodic explicit GC to break Python↔ObjC reference cycles that
         # accumulate from closures captured inside rebuilt menu items.
-        if now - self._last_gc_ts >= 60.0:
+        # 20 s is tight enough to limit accumulation even during bursts of
+        # alarm-event urgent rebuilds (which fire at most every 2 s).
+        if now - self._last_gc_ts >= 20.0:
             self._last_gc_ts = now
             gc.collect()
 
